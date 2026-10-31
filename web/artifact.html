@@ -1,0 +1,53 @@
+<title>wetpaint</title>
+<style>
+  /* One full-window painting app; the interface draws its own dark theme. */
+  :root {
+    --bg: #262626;
+    --fg: #d6d3cf;
+    --dim: #9b968f;
+    --warn: #e0a96d;
+    color-scheme: dark;
+  }
+  html, body { height: 100%; overflow: hidden; }
+  body { background: var(--bg); color: var(--fg); }
+  #wetpaint { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #status {
+    position: absolute; inset: 0; display: flex; flex-direction: column; gap: 8px;
+    align-items: center; justify-content: center; text-align: center; pointer-events: none;
+    padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+    color: var(--dim); font-size: 14px;
+  }
+  #status strong { color: var(--fg); font-size: 16px; font-weight: 600; }
+  #status.error strong { color: var(--warn); }
+</style>
+<canvas id="wetpaint"></canvas>
+<div id="status"><strong>wetpaint</strong><span id="status-text">Loading the painting engine (3.4 MB)…</span></div>
+<script type="module">
+/*WETPAINT_JS*/
+const status = document.getElementById("status");
+const text = document.getElementById("status-text");
+// the module ships gzipped in parts (wetpaint-<build>-gz-0.wasm, -1, …; see web/build.sh)
+// and is joined and unpacked here
+const BUILD = "/*WETPAINT_BUILD*/";
+async function wasmBytes() {
+  const parts = [];
+  for (let i = 0; ; i++) {
+    const r = await fetch(new URL(`./wetpaint-${BUILD}-gz-${i}.wasm`, document.baseURI));
+    if (!r.ok) break;
+    parts.push(await r.blob());
+  }
+  if (!parts.length) throw new Error("the engine's files are missing");
+  const stream = new Blob(parts).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream, { headers: { "Content-Type": "application/wasm" } });
+}
+wasmBytes()
+  .then((module_or_path) => __wbg_init({ module_or_path }))
+  .then(() => {
+    // the app reports a failed start in the status text; otherwise the canvas takes over
+    if (text.textContent.startsWith("Loading")) status.remove();
+  })
+  .catch((e) => {
+    status.classList.add("error");
+    text.textContent = "wetpaint could not start: " + e;
+  });
+</script>

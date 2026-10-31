@@ -11,8 +11,17 @@ members = [
     "crates/color",
     "crates/doc",
     "crates/app",
+    "crates/web",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+# The browser build (web/build.sh): smaller code for a faster download.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

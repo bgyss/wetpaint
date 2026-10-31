@@ -201,14 +201,15 @@ impl Document {
 
     /// Write [`Document::heightmap`] as a 16-bit (half float) EXR displacement map
     /// of the impasto paint's physical depth.
-    pub fn export_heightmap_exr(&self, path: &std::path::Path) -> std::io::Result<()> {
+    pub fn export_heightmap_exr(&self, out: impl std::io::Write + std::io::Seek) -> std::io::Result<()> {
+        use exr::prelude::*;
         let hm = self.heightmap();
         let w = self.w;
-        exr::prelude::write_rgba_file(path, self.w, self.h, |x, y| {
+        let channels = SpecificChannels::rgba(|Vec2(x, y)| {
             let v = f16::from_f32(hm[y * w + x]);
             (v, v, v, f16::ONE)
-        })
-        .map_err(std::io::Error::other)
+        });
+        Image::from_channels((self.w, self.h), channels).write().to_buffered(out).map_err(std::io::Error::other)
     }
 
     /// Crop the canvas to the bounding box of the selection (Crop Canvas).
@@ -415,9 +416,9 @@ mod tests {
         std::fs::write(dir.join("art_4.wetdoc"), b"x").unwrap();
         assert_eq!(iterative_path(&p), dir.join("art_5.wetdoc"));
         assert_eq!(iterative_path(&dir.join("art_4.wetdoc")), dir.join("art_5.wetdoc"));
-        let exr = dir.join("h.exr");
-        d.export_heightmap_exr(&exr).unwrap();
-        assert!(std::fs::metadata(&exr).unwrap().len() > 0);
+        let mut exr = std::io::Cursor::new(Vec::new());
+        d.export_heightmap_exr(&mut exr).unwrap();
+        assert!(exr.get_ref().starts_with(&[0x76, 0x2f, 0x31, 0x01]), "an OpenEXR file");
         std::fs::remove_dir_all(&dir).ok();
     }
 

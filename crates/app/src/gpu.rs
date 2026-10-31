@@ -74,6 +74,10 @@ pub struct GpuSim {
     /// A stroke's undo step on its way from the GPU: the layer and the label.
     pending: Option<(usize, String)>,
     pub adapter: String,
+    /// Step wet layers on the GPU; when false the GPU only composites the display. The web
+    /// starts without it: its GPU readbacks cannot block, which strokes on GPU-held layers
+    /// rely on.
+    pub simulate: bool,
 }
 
 impl GpuSim {
@@ -98,6 +102,7 @@ impl GpuSim {
             frame: 0,
             pending: None,
             adapter,
+            simulate: !cfg!(target_arch = "wasm32"),
         })
     }
 
@@ -147,7 +152,7 @@ impl GpuSim {
         self.fit(doc.layers.len());
         for i in 0..doc.layers.len() {
             let wet = &doc.layers[i].wet;
-            let gpu_ok = Some(i) != skip && wet.pigment.is_none();
+            let gpu_ok = self.simulate && Some(i) != skip && wet.pigment.is_none();
             if !gpu_ok {
                 if self.owns[i] {
                     if let Some(g) = &mut self.layers[i] {

@@ -1,9 +1,8 @@
 //! Application state and the commands shared by menus, panels and keyboard shortcuts.
 
-use std::{
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::path::{Path, PathBuf};
+
+use web_time::Instant;
 
 use wet_preset::BrushPreset;
 use wet_brush::{
@@ -14,6 +13,7 @@ use wet_brush::{
 use wet_doc::{Document, filters::Filter};
 use winit::keyboard::{Key, NamedKey};
 
+use crate::platform::{self, Pick, Target};
 use crate::transform::Xform;
 
 pub const PALETTE: [[f32; 3]; 12] = [
@@ -36,8 +36,8 @@ fn make_brush(tool: Tool) -> Brush {
 }
 
 /// Decode an image file (PNG, JPEG, TIFF, BMP) to straight RGBA8.
-pub fn read_rgba(path: impl AsRef<Path>) -> Option<(Vec<u8>, usize, usize)> {
-    let img = image::open(path).ok()?.to_rgba8();
+pub fn decode_rgba(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = (img.width() as usize, img.height() as usize);
     Some((img.into_raw(), w, h))
 }
@@ -293,53 +293,96 @@ impl App {
     /// Paint with a `.wetbrush` preset (its own size, spacing and textures), keeping the
     /// current tool and colour.
     pub fn load_preset(&mut self, path: &Path) {
+        match std::fs::read(path) {
+            Ok(b) => self.load_preset_bytes(&crate::library::preset_name(path).unwrap_or_default(), &b),
+            Err(e) => self.status = format!("cannot read preset {}: {e}", path.display()),
+        }
+    }
+
+    /// [`Self::load_preset`] from the file's contents; `name` is the file's preset name, if
+    /// any.
+    pub fn load_preset_bytes(&mut self, name: &str, bytes: &[u8]) {
         let tool = self.brush.tool;
-        match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| BrushPreset::from_bytes(&b).map_err(|e| e.to_string())) {
+        match BrushPreset::from_bytes(bytes) {
             Ok(p) => {
                 let color = self.brush.color;
                 self.brush = Brush::from_preset(&p);
                 self.brush.set_tool(tool);
                 self.brush.color = color;
                 self.mode = ClickMode::Paint;
-                let name = crate::library::preset_name(path).unwrap_or_else(|| p.name.clone());
+                let name = if name.is_empty() { p.name.clone() } else { name.to_owned() };
                 self.status = format!("brush preset {name}");
                 self.preset = Some(name);
                 self.source = Some(p);
             }
-            Err(e) => self.status = format!("cannot read preset {}: {e}", path.display()),
+            Err(e) => self.status = format!("cannot read preset {name}: {e}"),
         }
     }
 
     /// Open a dropped or command-line file: a `.wetdoc`, a brush preset, or an image as a
     /// new layer.
     pub fn open_path(&mut self, path: &Path) {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.open_bytes(&name, Some(path), &bytes);
+            }
+            Err(e) => self.status = format!("cannot open {}: {e}", path.display()),
+        }
+    }
+
+    /// [`Self::open_path`] from a file's name, path (if it has one) and contents.
+    pub fn open_bytes(&mut self, name: &str, path: Option<&Path>, bytes: &[u8]) {
         self.epoch += 1;
         self.release_gpu();
-        let ext = path.extension().and_then(|e| e.to_str()).map(str::to_lowercase);
-        if crate::library::is_preset(path) {
-            self.load_preset(path);
-        } else if ext.as_deref() == Some("wetdoc") {
+        let lower = name.to_lowercase();
+        if let Some(preset) = crate::library::preset_name(Path::new(name)) {
+            self.load_preset_bytes(&preset, bytes);
+        } else if lower.ends_with(".wetdoc") {
             if !self.confirm_discard() {
                 return;
             }
-            match std::fs::File::open(path).and_then(|f| Document::load(std::io::BufReader::new(f))) {
+            match Document::load(bytes) {
                 Ok(d) => {
                     self.doc = d;
                     self.zoom = 0.0;
-                    self.status = format!("opened {}", path.display());
-                    self.path = Some(path.to_owned());
+                    self.status = format!("opened {name}");
+                    self.path = path.map(Path::to_owned);
                     self.dirty = false;
                 }
                 Err(e) => self.status = format!("open failed: {e}"),
             }
-        } else if let Some((rgba, w, h)) = read_rgba(path) {
+        } else if let Some((rgba, w, h)) = decode_rgba(bytes) {
             self.doc.checkpoint_as("Import image");
-            let name = path.file_stem().and_then(|n| n.to_str()).unwrap_or("image").to_owned();
-            self.doc.import_image(&name, &rgba, w, h);
+            let stem = Path::new(name).file_stem().and_then(|n| n.to_str()).unwrap_or("image").to_owned();
+            self.doc.import_image(&stem, &rgba, w, h);
             self.dirty = true;
-            self.status = format!("imported {} as a layer", path.display());
+            self.status = format!("imported {name} as a layer");
         } else {
-            self.status = format!("cannot open {}", path.display());
+            self.status = format!("cannot open {name}");
+        }
+    }
+
+    /// Act on files the user picked (File > Open, tracing and reference images).
+    pub fn handle_picked(&mut self) {
+        for f in platform::take_picked() {
+            match f.kind {
+                Pick::Open => self.open_bytes(&f.name, f.path.as_deref(), &f.bytes),
+                Pick::Tracing => {
+                    if let Some((rgba, w, h)) = decode_rgba(&f.bytes) {
+                        let idx = self.doc.import_image("reference", &rgba, w, h);
+                        self.doc.layers[idx].tracing = true;
+                        self.doc.layers[idx].locked = true;
+                        self.doc.add_layer("tracing");
+                        self.epoch += 1;
+                    }
+                }
+                Pick::Reference => {
+                    if let Some((rgba, w, h)) = decode_rgba(&f.bytes) {
+                        self.doc.references.push(wet_doc::ReferenceImage { name: "reference".into(), w, h, rgba, visible: true });
+                    }
+                }
+            }
         }
     }
 
@@ -349,6 +392,7 @@ impl App {
 
     /// Advance the simulation by wall-clock time.
     pub fn tick(&mut self) {
+        self.handle_picked();
         let now = Instant::now();
         let dt = now.duration_since(self.last_step).as_secs_f32();
         self.last_step = now;
@@ -716,12 +760,13 @@ impl App {
         eprintln!("{}", self.status);
     }
 
-    fn save_to(&mut self, path: PathBuf) {
-        let r = std::fs::File::create(&path).and_then(|f| self.doc.save(std::io::BufWriter::new(f)));
+    fn save_to(&mut self, target: Target) {
+        let r = platform::write(&target, |out| self.doc.save(out));
         if r.is_ok() {
             self.dirty = false;
         }
-        self.report(&format!("saved {}", path.display()), r);
+        self.report(&format!("saved {}", target.describe()), r);
+        let Target::Path(path) = target else { return };
         self.path = Some(path);
     }
 
@@ -732,29 +777,14 @@ impl App {
             return true;
         }
         let name = self.path.as_deref().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("Untitled");
-        let answer = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Unsaved changes")
-            .set_description(format!("Save the changes to “{name}” first?"))
-            .set_buttons(rfd::MessageButtons::YesNoCancelCustom("Save".into(), "Don't Save".into(), "Cancel".into()))
-            .show();
-        match answer {
-            rfd::MessageDialogResult::Custom(b) if b == "Save" => {
+        match platform::ask_save_changes(name) {
+            Some(true) => {
                 self.run(Cmd::Save);
                 !self.dirty
             }
-            rfd::MessageDialogResult::Custom(b) if b == "Don't Save" => true,
-            rfd::MessageDialogResult::Yes => {
-                self.run(Cmd::Save);
-                !self.dirty
-            }
-            rfd::MessageDialogResult::No => true,
-            _ => false,
+            Some(false) => true,
+            None => false,
         }
-    }
-
-    fn save_dialog(name: &str, ext: &str) -> Option<PathBuf> {
-        rfd::FileDialog::new().set_file_name(name).add_filter(ext, &[ext]).save_file()
     }
 
     /// Start transforming the active layer.
@@ -837,6 +867,12 @@ impl App {
                 if self.gpu.take().is_some() {
                     self.status = "simulation on the CPU".into();
                 } else {
+                    let compute = |r: &egui_wgpu::RenderState| r.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+                    // on the web the window's device is the only one there is
+                    if self.render_state.as_ref().map_or(cfg!(target_arch = "wasm32"), |r| !compute(r)) {
+                        self.status = "this GPU has no compute shaders (WebGPU is needed)".into();
+                        return;
+                    }
                     let ctx = self.render_state.as_ref().map(|r| wet_fluid_gpu::GpuContext {
                         device: r.device.clone(),
                         queue: r.queue.clone(),
@@ -844,7 +880,8 @@ impl App {
                     });
                     match crate::gpu::GpuSim::new(&self.doc, ctx) {
                         Ok(g) => {
-                            self.status = format!("simulation on the GPU ({})", g.adapter);
+                            let what = if g.simulate { "simulation" } else { "display" };
+                            self.status = format!("{what} on the GPU ({})", g.adapter);
                             self.gpu = Some(g);
                         }
                         Err(e) => self.status = format!("no GPU simulation: {e}"),
@@ -872,16 +909,24 @@ impl App {
             }
             Cmd::SavePreset => {
                 let name = self.preset.clone().unwrap_or_else(|| "My Brush".into());
-                let mut dialog = rfd::FileDialog::new().set_file_name(format!("{name}.wetbrush")).add_filter("brush preset", &["wetbrush"]);
-                if let Some(dir) = crate::library::root().zip(crate::library::folder_for(self.brush.tool)).map(|(r, f)| r.join(f).join("My Brushes"))
-                    && std::fs::create_dir_all(&dir).is_ok()
+                #[cfg(not(target_arch = "wasm32"))]
                 {
-                    dialog = dialog.set_directory(dir);
+                    let mut dialog = rfd::FileDialog::new().set_file_name(format!("{name}.wetbrush")).add_filter("brush preset", &["wetbrush"]);
+                    if let Some(dir) = crate::library::root().zip(crate::library::folder_for(self.brush.tool)).map(|(r, f)| r.join(f).join("My Brushes"))
+                        && std::fs::create_dir_all(&dir).is_ok()
+                    {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(path) = dialog.save_file() {
+                        let r = self.save_preset(&path);
+                        self.report(&format!("saved preset {}", path.display()), r);
+                    }
                 }
-                if let Some(path) = dialog.save_file()
+                #[cfg(target_arch = "wasm32")]
                 {
-                    let r = self.save_preset(&path);
-                    self.report(&format!("saved preset {}", path.display()), r);
+                    let target = Target::Download(format!("{name}.wetbrush"));
+                    let r = platform::write(&target, |out| std::io::Write::write_all(out, &self.preset_bytes(&name)?));
+                    self.report(&format!("saved preset {}", target.describe()), r);
                 }
             }
             Cmd::NextColor => {
@@ -1041,26 +1086,17 @@ impl App {
                 // from it), or toggle tracing on the existing one
                 if let Some(l) = self.doc.layers.iter_mut().find(|l| l.locked && l.name == "reference") {
                     l.tracing = !l.tracing;
-                } else if let Some((rgba, w, h)) = rfd::FileDialog::new()
-                    .add_filter("image", &["png", "jpg", "jpeg", "tif", "tiff", "bmp"])
-                    .pick_file()
-                    .and_then(read_rgba)
-                {
-                    let idx = self.doc.import_image("reference", &rgba, w, h);
-                    self.doc.layers[idx].tracing = true;
-                    self.doc.layers[idx].locked = true;
-                    self.doc.add_layer("tracing");
+                } else {
+                    platform::pick(Pick::Tracing, &[("image", platform::IMAGES)]);
+                    self.handle_picked();
                 }
             }
             Cmd::ToggleReference => {
                 if let Some(r) = self.doc.references.first_mut() {
                     r.visible = !r.visible;
-                } else if let Some((rgba, w, h)) = rfd::FileDialog::new()
-                    .add_filter("image", &["png", "jpg", "jpeg", "tif", "tiff", "bmp"])
-                    .pick_file()
-                    .and_then(read_rgba)
-                {
-                    self.doc.references.push(wet_doc::ReferenceImage { name: "reference".into(), w, h, rgba, visible: true });
+                } else {
+                    platform::pick(Pick::Reference, &[("image", platform::IMAGES)]);
+                    self.handle_picked();
                 }
             }
             Cmd::CycleRuler => {
@@ -1099,6 +1135,10 @@ impl App {
             }
             Cmd::Fit => self.zoom = 0.0,
             Cmd::ToggleRecording => {
+                if cfg!(target_arch = "wasm32") {
+                    self.status = "time-lapse recording needs the desktop app".into();
+                    return;
+                }
                 self.recording = match self.recording {
                     Some(_) => None,
                     None => {
@@ -1117,45 +1157,39 @@ impl App {
                 self.path = None;
                 self.zoom = 0.0;
             }
-            Cmd::Open => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("wetpaint document", &["wetdoc"])
-                    .add_filter("image (as a layer)", &["png", "jpg", "jpeg", "tif", "tiff", "bmp"])
-                    .pick_file()
-                {
-                    self.open_path(&p);
-                }
-            }
+            Cmd::Open => platform::pick(
+                Pick::Open,
+                &[("wetpaint document", &["wetdoc"]), ("image (as a layer)", platform::IMAGES), ("brush preset", &["wetbrush"])],
+            ),
             Cmd::Save => match self.path.clone() {
-                Some(p) => self.save_to(p),
+                Some(p) => self.save_to(Target::Path(p)),
                 None => self.run(Cmd::SaveAs),
             },
             Cmd::SaveAs => {
-                if let Some(p) = Self::save_dialog("untitled.wetdoc", "wetdoc") {
-                    self.save_to(p);
+                if let Some(t) = platform::save_target("untitled.wetdoc", "wetdoc") {
+                    self.save_to(t);
                 }
             }
-            Cmd::SaveIterative => {
-                let base = self.path.clone().unwrap_or_else(|| PathBuf::from("wetpaint.wetdoc"));
-                let p = wet_doc::iterative_path(&base);
-                self.save_to(p);
-            }
+            Cmd::SaveIterative => match &self.path {
+                Some(p) => self.save_to(Target::Path(wet_doc::iterative_path(p))),
+                None => self.run(Cmd::SaveAs),
+            },
             Cmd::ExportPng => {
-                if let Some(p) = Self::save_dialog("painting.png", "png") {
-                    let r = std::fs::File::create(&p).and_then(|f| self.doc.export_png(std::io::BufWriter::new(f)));
-                    self.report(&format!("exported {}", p.display()), r);
+                if let Some(t) = platform::save_target("painting.png", "png") {
+                    let r = platform::write(&t, |out| self.doc.export_png(out));
+                    self.report(&format!("exported {}", t.describe()), r);
                 }
             }
             Cmd::ExportPsd => {
-                if let Some(p) = Self::save_dialog("painting.psd", "psd") {
-                    let r = std::fs::File::create(&p).and_then(|f| self.doc.export_psd(std::io::BufWriter::new(f)));
-                    self.report(&format!("exported {}", p.display()), r);
+                if let Some(t) = platform::save_target("painting.psd", "psd") {
+                    let r = platform::write(&t, |out| self.doc.export_psd(out));
+                    self.report(&format!("exported {}", t.describe()), r);
                 }
             }
             Cmd::ExportHeightmap => {
-                if let Some(p) = Self::save_dialog("painting_height.exr", "exr") {
-                    let r = self.doc.export_heightmap_exr(&p);
-                    self.report(&format!("exported {}", p.display()), r);
+                if let Some(t) = platform::save_target("painting_height.exr", "exr") {
+                    let r = platform::write(&t, |out| self.doc.export_heightmap_exr(out));
+                    self.report(&format!("exported {}", t.describe()), r);
                 }
             }
         }
@@ -1198,11 +1232,13 @@ impl App {
     /// Write the brush as a `.wetbrush`: its preset (tips, textures and the keys we do not
     /// model) with the edited parameters, and the preview stroke as thumbnail.
     pub fn save_preset(&self, path: &Path) -> std::io::Result<()> {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_end_matches(".wetbrush").to_owned())
-            .unwrap_or_default();
+        let name = crate::library::preset_name(path).unwrap_or_default();
+        std::fs::write(path, self.preset_bytes(&name)?)
+    }
+
+    /// The brush as a `.wetbrush` file's contents, named `name`.
+    pub fn preset_bytes(&self, name: &str) -> std::io::Result<Vec<u8>> {
+        let name = name.to_owned();
         let mut p = self.source.clone().unwrap_or_default();
         p.name = name;
         p.tool = self.brush.tool.id().into();
@@ -1214,7 +1250,7 @@ impl App {
             .write_to(&mut std::io::Cursor::new(&mut thumb), image::ImageFormat::Png)
             .map_err(std::io::Error::other)?;
         p.thumbnail = Some(thumb);
-        std::fs::write(path, p.to_bytes())
+        Ok(p.to_bytes())
     }
 
     pub fn record(&mut self, img: &[u8]) {

@@ -3,17 +3,22 @@ name = "wetpaint"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Interactive wet-media painting app on the open engine"
+description = "Interactive wet-media painting app on the wetpaint engine"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wetpaint"
+path = "src/main.rs"
 
 [dependencies]
 egui = "0.36.2"
-egui-winit = "0.36.2"
-egui-wgpu = { version = "0.36.2", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"] }
+egui-wgpu = { version = "0.36.2", default-features = false }
 wgpu = "30"
-pollster = "1"
-rfd = "0.17.2"
-winit = "0.30"
+winit = { version = "0.30", default-features = false }
 rayon = "1"
+web-time = "1"
 wet-preset = { path = "../preset" }
 serde_json = "1"
 wet-brush = { path = "../brush" }
@@ -25,6 +30,20 @@ wet-pigment = { path = "../pigment" }
 wet-paper = { path = "../paper" }
 png = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp"] }
+rfd = { version = "0.17.2", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui-winit = "0.36.2"
+egui-wgpu = { version = "0.36.2", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"] }
+winit = "0.30"
+pollster = "1"
+rfd = "0.17.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Blob", "Url", "Document", "Element", "HtmlAnchorElement", "Window"] }
 
 [dev-dependencies]
 half = "2.7.1"

@@ -33,6 +33,21 @@ View > GPU Simulation (Shift+C) runs the simulation on the GPU. Brush Creator sa
 `.wetbrush` presets into the brush library: `$WETPAINT_BRUSHES`, or `wetpaint/Brushes` in
 the platform's application data folder (`~/Library/Application Support` on macOS).
 
+## In the browser
+
+`crates/web` runs the same app in a browser with eframe: WebGPU when the browser has it
+(the display is composited on the GPU, the simulation runs on the CPU), WebGL otherwise.
+
+```
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129   # must match Cargo.lock
+web/build.sh                                       # → web/dist (wasm-opt is used if installed)
+python3 -m http.server -d web/dist 8099            # open http://127.0.0.1:8099/
+```
+
+`web/dist/artifact.html` is the same page laid out for hosts that serve one HTML file with
+the module beside it in 1 MiB gzipped parts.
+
 ## Licence
 
 Licensed under either of

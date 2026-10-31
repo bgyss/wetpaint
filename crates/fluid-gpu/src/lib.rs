@@ -833,7 +833,7 @@ impl GpuLayer {
                 return None;
             }
             let (buf, n) = (self.readback.clone(), self.w * self.h);
-            self.snap_thread = Some(std::thread::spawn(move || {
+            let convert = move || {
                 let snap = {
                     let data = buf.slice(..(14 * n * 4) as u64).get_mapped_range().expect("map snapshot");
                     let all: &[f32] = bytemuck::cast_slice(&data);
@@ -846,7 +846,17 @@ impl GpuLayer {
                 };
                 buf.unmap();
                 snap
-            }));
+            };
+            // the web has no threads (and its GPU objects stay on the main thread)
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.snap_state.store(DISPLAY_IDLE, Ordering::Release);
+                return Some(convert());
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.snap_thread = Some(std::thread::spawn(convert));
+            }
         }
         if !wait && !self.snap_thread.as_ref().is_some_and(|t| t.is_finished()) {
             return None;

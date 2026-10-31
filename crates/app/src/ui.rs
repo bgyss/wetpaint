@@ -1183,8 +1183,9 @@ fn decorate(app: &App, img: &mut [u8]) {
         return;
     }
     use rayon::prelude::*;
+    let greyscale = app.greyscale;
     img.par_chunks_exact_mut(4).enumerate().for_each(|(i, px)| {
-        if app.greyscale {
+        if greyscale {
             let y = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32).round() as u8;
             px[..3].fill(y);
         }
