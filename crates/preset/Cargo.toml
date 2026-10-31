@@ -1,0 +1,10 @@
+[package]
+name = "wet-preset"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Brush preset files (.wetbrush) for the wetpaint engine"
+
+[dependencies]
+base64 = "0.23.1"
+serde_json = "1"

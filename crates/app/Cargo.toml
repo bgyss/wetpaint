@@ -1,0 +1,30 @@
+[package]
+name = "wetpaint"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Interactive wet-media painting app on the open engine"
+
+[dependencies]
+egui = "0.36.2"
+egui-winit = "0.36.2"
+egui-wgpu = { version = "0.36.2", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"] }
+wgpu = "30"
+pollster = "1"
+rfd = "0.17.2"
+winit = "0.30"
+rayon = "1"
+wet-preset = { path = "../preset" }
+serde_json = "1"
+wet-brush = { path = "../brush" }
+wet-compose = { path = "../compose" }
+wet-doc = { path = "../doc" }
+wet-fluid = { path = "../fluid" }
+wet-fluid-gpu = { path = "../fluid-gpu" }
+wet-pigment = { path = "../pigment" }
+wet-paper = { path = "../paper" }
+png = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp"] }
+
+[dev-dependencies]
+half = "2.7.1"

@@ -1,0 +1,12 @@
+[package]
+name = "wet-fluid"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half = "2.7.1"
+rayon = "1"
+
+[dev-dependencies]
+png = "0.18.1"

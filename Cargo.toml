@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fluid",
+    "crates/fluid-gpu",
+    "crates/brush",
+    "crates/preset",
+    "crates/paper",
+    "crates/compose",
+    "crates/pigment",
+    "crates/color",
+    "crates/doc",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
