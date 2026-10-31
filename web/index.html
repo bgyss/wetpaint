@@ -17,7 +17,9 @@
 <canvas id="wetpaint"></canvas>
 <div id="status">Loading wetpaint…</div>
 <script type="module">
-  import init from "./wetpaint.js";
+  import init, { agent } from "./wetpaint.js";
+  // agents: `await window.wetpaint.call({op: "describe"})` (see wetpaint::agent)
+  window.wetpaint = { call: async (request) => JSON.parse(await agent(JSON.stringify(request))) };
   const status = document.getElementById("status");
   init({ module_or_path: new URL("./wetpaint_bg.wasm", import.meta.url) })
     .then(() => { if (status.textContent.startsWith("Loading")) status.remove(); })

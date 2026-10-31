@@ -3,10 +3,13 @@
 //! the GPU; the simulation runs on the CPU.
 //!
 //! The page needs a `<canvas id="wetpaint">`; `wasm-bindgen --target web` makes the module
-//! that starts it.
+//! that starts it. Its [`agent`] export takes agent requests (JSON text, see
+//! `wetpaint::agent`) and resolves with the reply once the app has answered between frames;
+//! the pages wrap it as `window.wetpaint.call(request)`.
 
 #![cfg(target_arch = "wasm32")]
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use wasm_bindgen::prelude::*;
@@ -17,6 +20,17 @@ use winit::keyboard::{Key, NamedKey};
 /// Canvas size of a new document: large enough to paint on, small enough for the CPU
 /// simulation to keep up in one browser thread.
 const CANVAS: (usize, usize) = (1024, 720);
+
+thread_local! {
+    /// Agent requests waiting for the next frame, with the promise resolvers for their replies.
+    static AGENT: RefCell<Vec<(String, js_sys::Function)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Send an agent request (JSON text); the promise resolves with the reply (JSON text).
+#[wasm_bindgen]
+pub fn agent(request: String) -> js_sys::Promise {
+    js_sys::Promise::new(&mut |resolve, _reject| AGENT.with_borrow_mut(|q| q.push((request.clone(), resolve))))
+}
 
 struct WebApp {
     app: App,
@@ -86,6 +100,10 @@ fn named(key: egui::Key) -> Option<NamedKey> {
 impl eframe::App for WebApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        for (request, resolve) in AGENT.with_borrow_mut(std::mem::take) {
+            let reply = wetpaint::agent::handle_line(&mut self.app, &request);
+            let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(&reply));
+        }
         self.keys(&ctx);
         self.app.tick();
         self.ui.show(root, &mut self.app);

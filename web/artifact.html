@@ -40,6 +40,8 @@ async function wasmBytes() {
   const stream = new Blob(parts).stream().pipeThrough(new DecompressionStream("gzip"));
   return new Response(stream, { headers: { "Content-Type": "application/wasm" } });
 }
+// agents: `await window.wetpaint.call({op: "describe"})` (see wetpaint::agent)
+window.wetpaint = { call: async (request) => JSON.parse(await agent(JSON.stringify(request))) };
 wasmBytes()
   .then((module_or_path) => __wbg_init({ module_or_path }))
   .then(() => {

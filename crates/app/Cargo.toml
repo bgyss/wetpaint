@@ -21,6 +21,7 @@ rayon = "1"
 web-time = "1"
 wet-preset = { path = "../preset" }
 serde_json = "1"
+base64 = "0.23"
 wet-brush = { path = "../brush" }
 wet-compose = { path = "../compose" }
 wet-doc = { path = "../doc" }

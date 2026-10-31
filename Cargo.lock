@@ -3143,6 +3143,7 @@ dependencies = [
 name = "wetpaint"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "egui",
  "egui-wgpu",
  "egui-winit",
@@ -3178,6 +3179,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui-wgpu",
+ "js-sys",
  "log",
  "wasm-bindgen",
  "wasm-bindgen-futures",

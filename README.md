@@ -48,6 +48,41 @@ python3 -m http.server -d web/dist 8099            # open http://127.0.0.1:8099/
 `web/dist/artifact.html` is the same page laid out for hosts that serve one HTML file with
 the module beside it in 1 MiB gzipped parts.
 
+## Agent control
+
+Everything the app does can also be driven by an agent or a script: every menu, panel and
+keyboard command, every slider, checkbox and picker, strokes and other canvas gestures,
+the simulation clock, rendering, and files. Requests are JSON objects with an `"op"`;
+`{"op": "describe"}` lists every op, command (by name), setting (by key, with its current
+value) and enumerated value. See `crates/app/src/agent.rs`.
+
+```
+wetpaint --mcp [W H] [FILE]        # MCP server on stdio, no window
+wetpaint --agent [W H] [FILE]      # JSON lines on stdin → replies on stdout, no window
+wetpaint --listen [ADDR]           # the window, also taking JSON lines on 127.0.0.1:7878
+wetpaint --mcp --connect [ADDR]    # MCP server that drives a --listen window
+```
+
+For example, with Claude Code: `claude mcp add wetpaint -- /path/to/wetpaint --mcp`. The
+`render` tool returns the painting as an image the model can see.
+
+```json
+{"op": "set", "values": {"brush.tool": "oil", "brush.color": "#c04020", "brush.size": 40}}
+{"op": "stroke", "points": [[40, 100, 0.3], [200, 110, 1.0], [280, 100, 0.5]], "steps_per_point": 2}
+{"op": "step", "n": 50}
+{"op": "command", "name": "filter", "args": {"filter": "hue_saturation", "hue": 30}}
+{"op": "render", "path": "painting.png"}
+```
+
+Without a window, the simulation advances only by `step` (25 steps a second), so a script
+gives the same pixels every time. Commands that open a dialog take a `path` instead, or
+`data` (base64) plus a `filename`. Without a path, exports come back as base64. Replacing
+or closing a document with unsaved changes needs `"discard": true`. In the browser, the
+page exposes the same API as `await window.wetpaint.call({op: "state"})`.
+
+`--listen` accepts requests from any process on this machine. Use it only on a machine
+you trust.
+
 ## Licence
 
 Licensed under either of

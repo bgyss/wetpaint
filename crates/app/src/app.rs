@@ -370,20 +370,31 @@ impl App {
                 Pick::Open => self.open_bytes(&f.name, f.path.as_deref(), &f.bytes),
                 Pick::Tracing => {
                     if let Some((rgba, w, h)) = decode_rgba(&f.bytes) {
-                        let idx = self.doc.import_image("reference", &rgba, w, h);
-                        self.doc.layers[idx].tracing = true;
-                        self.doc.layers[idx].locked = true;
-                        self.doc.add_layer("tracing");
-                        self.epoch += 1;
+                        self.import_tracing(&rgba, w, h);
                     }
                 }
                 Pick::Reference => {
                     if let Some((rgba, w, h)) = decode_rgba(&f.bytes) {
-                        self.doc.references.push(wet_doc::ReferenceImage { name: "reference".into(), w, h, rgba, visible: true });
+                        self.import_reference(rgba, w, h);
                     }
                 }
             }
         }
+    }
+
+    /// An image (straight RGBA8) as a locked tracing layer that strokes take their colour
+    /// from, with a new layer above it to paint on.
+    pub fn import_tracing(&mut self, rgba: &[u8], w: usize, h: usize) {
+        let idx = self.doc.import_image("reference", rgba, w, h);
+        self.doc.layers[idx].tracing = true;
+        self.doc.layers[idx].locked = true;
+        self.doc.add_layer("tracing");
+        self.epoch += 1;
+    }
+
+    /// An image (straight RGBA8) for the reference panel.
+    pub fn import_reference(&mut self, rgba: Vec<u8>, w: usize, h: usize) {
+        self.doc.references.push(wet_doc::ReferenceImage { name: "reference".into(), w, h, rgba, visible: true });
     }
 
     pub fn set_color(&mut self, c: [f32; 3]) {
@@ -752,7 +763,7 @@ impl App {
         })
     }
 
-    fn report(&mut self, what: &str, r: std::io::Result<()>) {
+    pub fn report(&mut self, what: &str, r: std::io::Result<()>) {
         self.status = match r {
             Ok(()) => what.to_owned(),
             Err(e) => format!("{what} failed: {e}"),
@@ -760,7 +771,7 @@ impl App {
         eprintln!("{}", self.status);
     }
 
-    fn save_to(&mut self, target: Target) {
+    pub fn save_to(&mut self, target: Target) {
         let r = platform::write(&target, |out| self.doc.save(out));
         if r.is_ok() {
             self.dirty = false;

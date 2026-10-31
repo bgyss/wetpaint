@@ -1,11 +1,17 @@
 //! The wetpaint app: document state and commands ([`app`]), the egui interface ([`ui`]),
 //! GPU simulation and display ([`gpu`]), and file access ([`platform`]). The desktop
-//! binary and the web build drive it.
+//! binary and the web build drive it. Agents drive it too: [`agent`] answers JSON
+//! requests for every command, setting and canvas gesture, over stdio, TCP ([`serve`]),
+//! MCP ([`mcp`]) or, on the web, from JavaScript.
 
+pub mod agent;
 pub mod app;
 pub mod gpu;
 pub mod library;
+pub mod mcp;
 pub mod platform;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod serve;
 pub mod transform;
 pub mod ui;
 

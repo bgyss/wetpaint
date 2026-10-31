@@ -1175,7 +1175,7 @@ fn color_image(w: usize, h: usize, rgba: &[u8]) -> egui::ColorImage {
 }
 
 /// Greyscale view, stencil film and the dimmed area outside a selection.
-fn decorate(app: &App, img: &mut [u8]) {
+pub(crate) fn decorate(app: &App, img: &mut [u8]) {
     let w = app.doc.w;
     let stencils: Vec<&wet_doc::Stencil> = app.doc.stencils.iter().filter(|s| s.visible).collect();
     let sel = app.doc.selection.as_deref();
