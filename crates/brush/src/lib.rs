@@ -531,6 +531,8 @@ pub struct Brush {
     mask: Vec<f32>,
     mask_w: Vec<f32>,
     own: Vec<f32>,
+    /// Relief (settled paint thickness) laid by this stroke.
+    own_th: Vec<f32>,
     /// Per-stroke dual-brush mask `D`.
     dual_acc: Vec<f32>,
     /// Centre of the previous dab of this stroke (for `splat_smudge` sweeps).
@@ -580,6 +582,7 @@ impl Brush {
             mask: Vec::new(),
             mask_w: Vec::new(),
             own: Vec::new(),
+            own_th: Vec::new(),
             dual_acc: Vec::new(),
             prev_dab: None,
             multi: Vec::new(),
@@ -633,7 +636,7 @@ impl Brush {
     pub fn press(&mut self, s: Sample) {
         self.rng = Rng::new(self.seed);
         self.spacer.press(s);
-        for buf in [&mut self.mask, &mut self.mask_w, &mut self.own, &mut self.dual_acc] {
+        for buf in [&mut self.mask, &mut self.mask_w, &mut self.own, &mut self.own_th, &mut self.dual_acc] {
             buf.iter_mut().for_each(|v| *v = 0.0);
         }
         self.carry = None;
@@ -741,7 +744,7 @@ impl Brush {
         let (w, h) = (layer.w, layer.h);
         let n = w * h;
         if self.mask.len() != n {
-            for buf in [&mut self.mask, &mut self.mask_w, &mut self.own, &mut self.dual_acc] {
+            for buf in [&mut self.mask, &mut self.mask_w, &mut self.own, &mut self.own_th, &mut self.dual_acc] {
                 *buf = vec![0.0; n];
             }
         }
@@ -870,7 +873,7 @@ impl Brush {
         let (w, h) = (layer.w as i64, layer.h as i64);
         let n = layer.w * layer.h;
         if self.mask.len() != n {
-            for buf in [&mut self.mask, &mut self.mask_w, &mut self.own, &mut self.dual_acc] {
+            for buf in [&mut self.mask, &mut self.mask_w, &mut self.own, &mut self.own_th, &mut self.dual_acc] {
                 *buf = vec![0.0; n];
             }
         }
@@ -1142,9 +1145,16 @@ impl Brush {
                     if m.wet {
                         layer.deposit(c, water_t * if self.calib.water_follows_paint { dm } else { dmw }, color, add);
                     } else {
+                        // fresh paint pushes the relief of the strokes below flat as it covers
+                        // their colour, so their edges don't show through as ridges
+                        let th = layer.mid.thickness.cur().data[c];
+                        let under = (th - self.own_th[c]).max(0.0);
+                        let th = th - under * layer.lut.eval(add * layer.maps.stencil_at(c));
+                        layer.mid.thickness.cur_mut().data[c] = th;
                         // thickness follows the dab profile (brush space), so repeated dabs build
                         // relief ridges along the stroke even where the colour saturates
                         tool::deposit_settled(layer, c, color, add, m.thickness * (0.4 + 0.6 * g));
+                        self.own_th[c] += layer.mid.thickness.cur().data[c] - th;
                     }
                 }
             }
@@ -1162,10 +1172,23 @@ impl Brush {
                 }
             }
             Tool::Eraser => {
+                // the eraser takes away a share of the paint's coverage (not of its amount,
+                // which would leave a veil of thickly laid media) and its relief with it
                 for &(c, dm, _) in cells {
                     let k = (self.calib.erase * opacity * dm).min(1.0);
-                    layer.dens.amount.cur_mut().data[c] *= 1.0 - k;
-                    layer.mid.amount.cur_mut().data[c] *= 1.0 - k;
+                    for p in [&mut layer.dens, &mut layer.mid] {
+                        let a = p.amount.cur().data[c];
+                        if a <= 0.0 {
+                            continue;
+                        }
+                        let left = if k >= 1.0 {
+                            0.0
+                        } else {
+                            wet_fluid::lut::OpacityLut::inverse(layer.lut.eval(a) * (1.0 - k)).min(a)
+                        };
+                        p.amount.cur_mut().data[c] = left;
+                        p.thickness.cur_mut().data[c] *= left / a;
+                    }
                 }
             }
             Tool::Blend => {

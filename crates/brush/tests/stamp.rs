@@ -114,6 +114,45 @@ fn eraser_and_water_tools() {
     assert_eq!(l2.dens.amount.cur().data[c], 0.0);
 }
 
+/// On oil the eraser removes the paint's coverage and relief as it does on watercolour,
+/// instead of leaving a veil of the thickly laid paint.
+#[test]
+fn eraser_clears_oil_coverage_and_relief() {
+    let mut b = soft_brush();
+    b.set_tool(wet_brush::Tool::Paint(wet_brush::Medium::Oil));
+    let mut l = WetLayer::new(128, 64);
+    paint_line(&mut b, &mut l, 32.0);
+    let c = 32 * 128 + 60;
+    let (a, th) = (l.mid.amount.cur().data[c], l.mid.thickness.cur().data[c]);
+    assert!(l.lut.eval(a) > 0.9 && th > 0.0);
+    b.set_tool(wet_brush::Tool::Eraser);
+    paint_line(&mut b, &mut l, 32.0);
+    assert!(l.lut.eval(l.mid.amount.cur().data[c]) < 0.15);
+    assert!(l.mid.thickness.cur().data[c] < 0.1 * th);
+}
+
+/// An oil stroke over wet oil flattens the relief of the stroke below, so its edges don't
+/// show through as lines; its own relief stays.
+#[test]
+fn oil_over_oil_flattens_the_relief_below() {
+    let mut b = soft_brush();
+    b.set_tool(wet_brush::Tool::Paint(wet_brush::Medium::Oil));
+    let mut l = WetLayer::new(128, 64);
+    paint_line(&mut b, &mut l, 26.0);
+    let th = |l: &WetLayer, y: usize| l.mid.thickness.cur().data[y * 128 + 60];
+    // the first stroke's relief drops steeply at its lower edge
+    let (edge, inside) = (th(&l, 35), th(&l, 33));
+    assert!(edge < 0.6 * inside);
+    b.color = [40.0, 60.0, 200.0];
+    paint_line(&mut b, &mut l, 34.0);
+    // across the old edge the relief is the new stroke's, as on clean paper
+    let mut fresh = WetLayer::new(128, 64);
+    paint_line(&mut b, &mut fresh, 34.0);
+    for y in 31..=37 {
+        assert!((th(&l, y) - th(&fresh, y)).abs() < 0.1 * th(&fresh, 34), "row {y}");
+    }
+}
+
 #[test]
 fn smudge_carries_paint_along_the_stroke() {
     let mut b = soft_brush();
