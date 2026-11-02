@@ -217,6 +217,8 @@ pub struct App {
     pub xform: Option<Xform>,
     /// ⌘/Ctrl held: a dragged transform corner moves on its own (perspective).
     pub free_corner: bool,
+    /// An agent's gesture is still pressed: its next stroke or drag goes on with it.
+    pub held: bool,
     /// Wet layers step on the GPU (View > GPU Simulation).
     pub gpu: Option<crate::gpu::GpuSim>,
     /// The window's GPU device and renderer: the GPU simulation shares the device and the
@@ -269,6 +271,7 @@ impl App {
             sim_rate: 0.0,
             xform: None,
             free_corner: false,
+            held: false,
             gpu: None,
             render_state: None,
             epoch: 0,

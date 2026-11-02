@@ -126,6 +126,7 @@ pub const OPS: &[Op] = &[
         args: &[
             ("points", "array", "[[x, y], [x, y, pressure], {\"x\", \"y\", \"pressure\"}, ...] in canvas pixels; pressure 0–1"),
             ("steps_per_point", "integer", "simulation steps between points (0: the stroke is instantaneous)"),
+            ("hold", "boolean", "keep the pointer down: the next stroke goes on with the same gesture (render and step in between to watch it)"),
             LAYER_ARG,
         ],
     },
@@ -137,6 +138,7 @@ pub const OPS: &[Op] = &[
             ("mode", "string", "click mode to use (see enums.mode)"),
             ("free_corner", "boolean", "transform: a dragged corner moves on its own (perspective), as with ⌘/Ctrl held"),
             ("steps_per_point", "integer", "simulation steps between points"),
+            ("hold", "boolean", "keep the pointer down: the next drag goes on with the same gesture"),
         ],
     },
     Op {
@@ -975,9 +977,16 @@ fn gesture(app: &mut App, a: &Value) -> R<Value> {
         app.cursor = (x, y);
         app.pressure = p.or(saved);
     };
-    to(app, pts[0]);
-    app.press();
-    for &p in &pts[1..] {
+    let hold = bool_or(a, "hold", false)?;
+    // a held gesture goes on from where it was: its first point is a move, not a press
+    let rest = if app.held {
+        &pts[..]
+    } else {
+        to(app, pts[0]);
+        app.press();
+        &pts[1..]
+    };
+    for &p in rest {
         if steps > 0 {
             app.flush_stroke(false);
             app.step_sim(steps);
@@ -985,11 +994,17 @@ fn gesture(app: &mut App, a: &Value) -> R<Value> {
         to(app, p);
         app.moved();
     }
-    app.release();
-    app.free_corner = false;
+    app.held = hold;
+    if hold {
+        // the paint so far shows in renders and flows with `step` until the gesture goes on
+        app.flush_stroke(false);
+    } else {
+        app.release();
+        app.free_corner = false;
+    }
     app.pressure = saved;
     app.epoch += 1;
-    Ok(json!({ "points": pts.len(), "layer": app.doc.active }))
+    Ok(json!({ "points": pts.len(), "layer": app.doc.active, "held": hold }))
 }
 
 fn select(app: &mut App, a: &Value) -> R<Value> {
@@ -1932,6 +1947,25 @@ mod tests {
     }
 
     use wet_doc::Document;
+
+    #[test]
+    fn a_held_stroke_in_pieces_paints_as_one() {
+        let pts: Vec<Value> = (0..16).map(|k| json!([10 + k * 8, 40 + (k % 3) * 4, 0.9])).collect();
+        let paint = |pieces: &[std::ops::Range<usize>], hold: bool| {
+            let mut app = headless(160, 80);
+            call(&mut app, json!({ "op": "set", "values": { "brush.tool": "oil", "brush.size": 20 } }));
+            for (k, r) in pieces.iter().enumerate() {
+                let held = hold && k + 1 < pieces.len();
+                let r = call(&mut app, json!({ "op": "stroke", "points": pts[r.clone()], "hold": held }));
+                assert_eq!(r["held"], held);
+                assert_eq!(app.held, held);
+            }
+            app.doc.render(None)
+        };
+        let whole = paint(&[0..16], false);
+        assert!(whole != paint(&[0..8, 7..16], false), "two strokes are not one");
+        assert!(whole == paint(&[0..5, 5..11, 11..16], true), "held pieces go on with the same gesture");
+    }
 
     #[test]
     fn every_command_parses_and_names_itself() {
