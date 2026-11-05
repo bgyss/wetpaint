@@ -1,0 +1,35 @@
+[package]
+name = "wetpaint-gpui"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Spike: the wetpaint app on gpui instead of egui"
+publish = false
+
+# Its own workspace, so gpui's dependency tree stays out of the main build.
+[workspace]
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "c7bea343838f42b4c14151393e41f0bbe033c95e" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c7bea343838f42b4c14151393e41f0bbe033c95e", default-features = false, features = ["runtime_shaders"] }
+wetpaint = { path = "../../crates/app", default-features = false }
+wet-pigment = { path = "../../crates/pigment" }
+wet-compose = { path = "../../crates/compose" }
+image = { version = "0.25", default-features = false }
+serde_json = "1"
+web-time = "1"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen = "=0.2.130"
+web-sys = { version = "0.3", features = ["console"] }
+
+# Zed's own workspace patches, which a git dependency does not inherit.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+# One wgpu for gpui and the engine: two copies clash in the browser (both export the
+# WebGPU bindings), and only one lets the canvas and gpui share a device.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007" }
+
+[profile.release]
+debug = "line-tables-only"
