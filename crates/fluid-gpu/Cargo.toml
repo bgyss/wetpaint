@@ -11,4 +11,4 @@ pollster = "1.0.1"
 rayon = "1"
 wet-compose = { path = "../compose" }
 wet-fluid = { version = "0.1.0", path = "../fluid" }
-wgpu = "30.0.1"
+wgpu = "30"

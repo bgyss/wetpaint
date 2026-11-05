@@ -13,12 +13,14 @@ use wet_doc::Document;
 use wet_fluid_gpu::display::{Backdrop, Compositor, DisplayLayer, GroupBlend, Metallic, Source};
 use wet_fluid_gpu::{GpuContext, GpuError, GpuLayer};
 
+#[cfg(feature = "window")]
 type Renderer = std::sync::Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>;
 
 /// Display compositing on the GPU, drawn by the window from the compositor's texture.
 struct Display {
     comp: Compositor,
     /// The window's renderer, the texture's id there and the filter it was registered with.
+    #[cfg(feature = "window")]
     tex: Option<(Renderer, egui::TextureId, wgpu::FilterMode)>,
     /// [`crate::app::App::epoch`] when the CPU layers were last uploaded.
     epoch: u64,
@@ -42,6 +44,7 @@ pub struct View {
     pub painting: Option<usize>,
 }
 
+#[cfg(feature = "window")]
 impl Drop for Display {
     fn drop(&mut self) {
         if let Some((r, id, _)) = &self.tex {
@@ -270,6 +273,7 @@ impl GpuSim {
         if self.display.as_ref().is_none_or(|d| (d.comp.w, d.comp.h) != (doc.w, doc.h)) {
             self.display = Some(Display {
                 comp: Compositor::new(&self.ctx, doc.w, doc.h),
+                #[cfg(feature = "window")]
                 tex: None,
                 epoch: view.epoch.wrapping_sub(1),
                 paper: None,
@@ -347,6 +351,7 @@ impl GpuSim {
     }
 
     /// [`Self::composite`], returning the texture registered with the window's renderer.
+    #[cfg(feature = "window")]
     pub fn compose(
         &mut self,
         doc: &Document,

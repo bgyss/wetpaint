@@ -13,6 +13,7 @@ pub mod platform;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod serve;
 pub mod transform;
+#[cfg(feature = "window")]
 pub mod ui;
 
 pub const SHORTCUTS: &str = "\

@@ -224,6 +224,7 @@ pub struct App {
     /// The window's GPU device and renderer: the GPU simulation shares the device and the
     /// display composited on it is drawn from there (`None` without a window: the
     /// simulation opens its own device and the display is composited on the CPU).
+    #[cfg(feature = "window")]
     pub render_state: Option<egui_wgpu::RenderState>,
     /// Changes whenever a layer may have been edited (commands, strokes, opening), so the
     /// GPU display uploads CPU layers again.
@@ -273,6 +274,7 @@ impl App {
             free_corner: false,
             held: false,
             gpu: None,
+            #[cfg(feature = "window")]
             render_state: None,
             epoch: 0,
             dirty: false,
@@ -457,10 +459,23 @@ impl App {
     /// Can the display be composited on the GPU? It needs the GPU simulation and a window;
     /// time-lapse recording reads the painting on the CPU.
     pub fn gpu_display_ok(&self) -> bool {
-        self.gpu.is_some() && self.render_state.is_some() && self.recording.is_none()
+        self.gpu.is_some() && self.window_gpu().is_some() && self.recording.is_none()
+    }
+
+    /// The window's GPU device, to share with the simulation, and whether it runs compute
+    /// shaders (`None` without a window).
+    pub fn window_gpu(&self) -> Option<(wet_fluid_gpu::GpuContext, bool)> {
+        #[cfg(feature = "window")]
+        return self.render_state.as_ref().map(|r| {
+            let ctx = wet_fluid_gpu::GpuContext { device: r.device.clone(), queue: r.queue.clone(), adapter_info: r.adapter.get_info() };
+            (ctx, r.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS))
+        });
+        #[cfg(not(feature = "window"))]
+        None
     }
 
     /// Composite the display on the GPU when [`Self::gpu_display_ok`]: the texture to draw.
+    #[cfg(feature = "window")]
     pub fn gpu_display(&mut self, filter: wgpu::FilterMode) -> Option<egui::TextureId> {
         let ok = self.gpu_display_ok();
         let g = self.gpu.as_mut()?;
@@ -881,17 +896,13 @@ impl App {
                 if self.gpu.take().is_some() {
                     self.status = "simulation on the CPU".into();
                 } else {
-                    let compute = |r: &egui_wgpu::RenderState| r.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS);
+                    let window = self.window_gpu();
                     // on the web the window's device is the only one there is
-                    if self.render_state.as_ref().map_or(cfg!(target_arch = "wasm32"), |r| !compute(r)) {
+                    if window.as_ref().map_or(cfg!(target_arch = "wasm32"), |(_, compute)| !compute) {
                         self.status = "this GPU has no compute shaders (WebGPU is needed)".into();
                         return;
                     }
-                    let ctx = self.render_state.as_ref().map(|r| wet_fluid_gpu::GpuContext {
-                        device: r.device.clone(),
-                        queue: r.queue.clone(),
-                        adapter_info: r.adapter.get_info(),
-                    });
+                    let ctx = window.map(|(ctx, _)| ctx);
                     match crate::gpu::GpuSim::new(&self.doc, ctx) {
                         Ok(g) => {
                             let what = if g.simulate { "simulation" } else { "display" };
@@ -1281,4 +1292,35 @@ impl App {
         }
         self.recording = Some((n + 1, Instant::now()));
     }
+}
+
+/// Greyscale view, stencil film and the dimmed area outside a selection.
+pub(crate) fn decorate(app: &App, img: &mut [u8]) {
+    let w = app.doc.w;
+    let stencils: Vec<&wet_doc::Stencil> = app.doc.stencils.iter().filter(|s| s.visible).collect();
+    let sel = app.doc.selection.as_deref();
+    if !app.greyscale && stencils.is_empty() && sel.is_none() {
+        return;
+    }
+    use rayon::prelude::*;
+    let greyscale = app.greyscale;
+    img.par_chunks_exact_mut(4).enumerate().for_each(|(i, px)| {
+        if greyscale {
+            let y = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32).round() as u8;
+            px[..3].fill(y);
+        }
+        if !stencils.is_empty() {
+            let (x, y) = ((i % w) as f32, (i / w) as f32);
+            let k = stencils.iter().map(|s| s.coverage(x, y)).fold(0.0f32, f32::max);
+            for (v, t) in px[..3].iter_mut().zip([150.0, 90.0, 200.0]) {
+                *v = (*v as f32 * (1.0 - 0.35 * k) + t * 0.35 * k) as u8;
+            }
+        }
+        if let Some(m) = sel {
+            let k = 1.0 - 0.35 * (1.0 - m[i] as f32 / 255.0);
+            for v in &mut px[..3] {
+                *v = (*v as f32 * k) as u8;
+            }
+        }
+    });
 }

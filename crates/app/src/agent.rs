@@ -1136,7 +1136,7 @@ fn resize(app: &mut App, a: &Value) -> R<Value> {
     }
     app.epoch += 1;
     app.dirty = true;
-    app.zoom = if app.render_state.is_some() { 0.0 } else { app.zoom };
+    app.zoom = if app.window_gpu().is_some() { 0.0 } else { app.zoom };
     Ok(json!({ "width": app.doc.w, "height": app.doc.h }))
 }
 
@@ -1161,7 +1161,7 @@ fn render(app: &mut App, a: &Value) -> R<Value> {
     } else {
         let mut img = composite(app);
         if bool_or(a, "view", false)? {
-            crate::ui::decorate(app, &mut img);
+            crate::app::decorate(app, &mut img);
         }
         img
     };

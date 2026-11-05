@@ -9,7 +9,7 @@ use wet_doc::filters::Filter;
 use std::{collections::HashMap, path::PathBuf};
 
 use crate::{
-    app::{App, ClickMode, Cmd, PALETTE},
+    app::{App, ClickMode, Cmd, PALETTE, decorate},
     library,
 };
 
@@ -1174,36 +1174,6 @@ fn color_image(w: usize, h: usize, rgba: &[u8]) -> egui::ColorImage {
     egui::ColorImage::new([w, h], pixels)
 }
 
-/// Greyscale view, stencil film and the dimmed area outside a selection.
-pub(crate) fn decorate(app: &App, img: &mut [u8]) {
-    let w = app.doc.w;
-    let stencils: Vec<&wet_doc::Stencil> = app.doc.stencils.iter().filter(|s| s.visible).collect();
-    let sel = app.doc.selection.as_deref();
-    if !app.greyscale && stencils.is_empty() && sel.is_none() {
-        return;
-    }
-    use rayon::prelude::*;
-    let greyscale = app.greyscale;
-    img.par_chunks_exact_mut(4).enumerate().for_each(|(i, px)| {
-        if greyscale {
-            let y = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32).round() as u8;
-            px[..3].fill(y);
-        }
-        if !stencils.is_empty() {
-            let (x, y) = ((i % w) as f32, (i / w) as f32);
-            let k = stencils.iter().map(|s| s.coverage(x, y)).fold(0.0f32, f32::max);
-            for (v, t) in px[..3].iter_mut().zip([150.0, 90.0, 200.0]) {
-                *v = (*v as f32 * (1.0 - 0.35 * k) + t * 0.35 * k) as u8;
-            }
-        }
-        if let Some(m) = sel {
-            let k = 1.0 - 0.35 * (1.0 - m[i] as f32 / 255.0);
-            for v in &mut px[..3] {
-                *v = (*v as f32 * k) as u8;
-            }
-        }
-    });
-}
 
 #[cfg(test)]
 mod tests {

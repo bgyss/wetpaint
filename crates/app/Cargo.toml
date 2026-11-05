@@ -11,10 +11,17 @@ path = "src/lib.rs"
 [[bin]]
 name = "wetpaint"
 path = "src/main.rs"
+required-features = ["window"]
+
+[features]
+default = ["window"]
+# The egui interface and the window's GPU device (egui-wgpu). Without it the app is the
+# document, commands and agent ops, for another interface or none.
+window = ["dep:egui-wgpu"]
 
 [dependencies]
 egui = "0.36.2"
-egui-wgpu = { version = "0.36.2", default-features = false }
+egui-wgpu = { version = "0.36.2", default-features = false, optional = true }
 wgpu = "30"
 winit = { version = "0.30", default-features = false }
 rayon = "1"
@@ -35,7 +42,7 @@ rfd = { version = "0.17.2", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 egui-winit = "0.36.2"
-egui-wgpu = { version = "0.36.2", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"] }
+egui-wgpu = { version = "0.36.2", default-features = false, features = ["winit", "macos-window-resize-jitter-fix"], optional = true }
 winit = "0.30"
 pollster = "1"
 rfd = "0.17.2"
