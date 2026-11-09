@@ -1,0 +1,278 @@
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 6ddbac4c43..e9d722a4c8 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1400,6 +1400,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn set_client_inset(&self, _inset: Pixels) {}
+     fn set_client_corner_radii(&self, _radii: Corners<Pixels>) {}
+     fn gpu_specs(&self) -> Option<GpuSpecs>;
++    /// See [`crate::Window::external_gpu`].
++    fn external_gpu(&self) -> Option<Box<dyn std::any::Any>> {
++        None
++    }
+ 
+     fn update_ime_position(&self, _bounds: Bounds<Pixels>);
+ 
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index a4116aa525..4842afcfa8 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -9,6 +9,7 @@ use crate::{
+     Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+ };
+ use std::{
++    any::Any,
+     fmt::Debug,
+     iter::Peekable,
+     ops::{Add, Range, Sub},
+@@ -771,6 +772,33 @@ pub struct PaintSurface {
+     pub content_mask: ContentMask<ScaledPixels>,
+     #[cfg(any(target_os = "macos", target_os = "ios"))]
+     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
++    /// The texture to draw, where the renderer can draw one the application owns.
++    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
++    pub texture: ExternalTexture,
++}
++
++/// A GPU texture the application owns and renders itself, drawn by the window's renderer
++/// without a copy: a view of a texture on the device from [`crate::Window::external_gpu`].
++///
++/// It is opaque to gpui. The wgpu renderer takes a `wgpu::TextureView` of an RGBA texture
++/// with straight alpha, sampled as it is stored (as images are).
++///
++/// Not `Send`: in the browser wgpu's handles belong to the thread that made them, and a
++/// scene is built and drawn on the window's thread.
++#[derive(Clone)]
++pub struct ExternalTexture(pub std::rc::Rc<dyn Any>);
++
++impl ExternalTexture {
++    /// Wrap a renderer-specific texture view.
++    pub fn new(view: impl Any) -> Self {
++        Self(std::rc::Rc::new(view))
++    }
++}
++
++impl Debug for ExternalTexture {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("ExternalTexture")
++    }
+ }
+ 
+ impl From<PaintSurface> for Primitive {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 4e2e1a798c..c20823fe6f 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -5421,6 +5421,38 @@ impl Window {
+         });
+     }
+ 
++    /// Paint a texture the application owns into the scene for the next frame at the
++    /// current z-index, on renderers that can draw one (see [`Self::external_gpu`]).
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
++    pub fn paint_external_texture(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        texture: crate::ExternalTexture,
++    ) {
++        use crate::PaintSurface;
++
++        self.invalidator.debug_assert_paint();
++
++        let bounds = self.snap_bounds(bounds);
++        let content_mask = self.snapped_content_mask();
++        self.next_frame.scene.insert_primitive(PaintSurface {
++            order: 0,
++            bounds,
++            content_mask,
++            texture,
++        });
++    }
++
++    /// The GPU device the window is drawn with, for an application that renders its own
++    /// textures and has them drawn with [`Self::paint_external_texture`]: renderer-specific
++    /// handles (the wgpu renderer gives `(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)`),
++    /// or `None` where the renderer cannot share its device.
++    pub fn external_gpu(&self) -> Option<Box<dyn std::any::Any>> {
++        self.platform_window.external_gpu()
++    }
++
+     /// Removes an image from the sprite atlas.
+     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+         for frame_index in 0..data.frame_count() {
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index ddd9095040..51d1a03f90 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -1025,6 +1025,11 @@ impl PlatformWindow for WebWindow {
+         self.inner.state.borrow().renderer.gpu_specs()
+     }
+ 
++    fn external_gpu(&self) -> Option<Box<dyn std::any::Any>> {
++        let handles = self.inner.state.borrow().renderer.external_gpu()?;
++        Some(Box::new(handles))
++    }
++
+     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+ 
+     fn request_decorations(&self, _decorations: WindowDecorations) {}
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+index 9be210bf22..38d9991af0 100644
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -1360,3 +1360,13 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+ 
+     return ycbcr_to_RGB * y_cb_cr;
+ }
++
++// A texture the application owns (RGBA, straight alpha), bound as `t_y`.
++@fragment
++fn fs_surface_rgba(input: SurfaceVarying) -> @location(0) vec4<f32> {
++    if (any(input.clip_distances < vec4<f32>(0.0))) {
++        return vec4<f32>(0.0);
++    }
++    let color = textureSampleLevel(t_y, s_surface, input.texture_position, 0.0);
++    return blend_color(color, 1.0);
++}
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index 46f9ffdb98..16e10aeb83 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -134,6 +134,8 @@ struct WgpuPipelines {
+     poly_sprites: wgpu::RenderPipeline,
+     #[allow(dead_code)]
+     surfaces: wgpu::RenderPipeline,
++    /// Application-owned RGBA textures (`gpui::ExternalTexture`).
++    external_textures: wgpu::RenderPipeline,
+ }
+ 
+ /// One frame allocation of instance data, ready to bind.
+@@ -949,6 +951,19 @@ impl WgpuRendererCore {
+             &layouts.surfaces,
+             None,
+             wgpu::PrimitiveTopology::TriangleStrip,
++            &[Some(color_target.clone())],
++            1,
++            &shader_module,
++        );
++
++        let external_textures = create_pipeline(
++            "external_textures",
++            "vs_surface",
++            "fs_surface_rgba",
++            &layouts.globals,
++            &layouts.surfaces,
++            None,
++            wgpu::PrimitiveTopology::TriangleStrip,
+             &[Some(color_target)],
+             1,
+             &shader_module,
+@@ -964,6 +979,7 @@ impl WgpuRendererCore {
+             subpixel_sprites,
+             poly_sprites,
+             surfaces,
++            external_textures,
+         }
+     }
+ 
+@@ -1140,6 +1156,16 @@ impl WgpuRenderer {
+         })
+     }
+ 
++    /// The device this renderer draws with, for `gpui::Window::external_gpu`.
++    pub fn external_gpu(&self) -> Option<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)> {
++        let core = self.core()?;
++        Some((
++            (*core.resources.device).clone(),
++            (*core.resources.queue).clone(),
++            core.adapter_info.clone(),
++        ))
++    }
++
+     pub fn max_texture_size(&self) -> u32 {
+         self.max_texture_size
+     }
+@@ -1633,9 +1659,13 @@ impl WgpuRendererCore {
+                             &mut pass,
+                         )?;
+                     }
+-                    // Surfaces are macOS-only for video playback and are not
+-                    // implemented by the WGPU renderer.
+-                    PrimitiveBatch::Surfaces(_surfaces) => {}
++                    // Video surfaces are macOS-only. Here a surface is a texture the
++                    // application owns, on this renderer's device.
++                    PrimitiveBatch::Surfaces(range) => {
++                        for surface in &scene.surfaces[range] {
++                            self.draw_external_texture(surface, &mut pass);
++                        }
++                    }
+                 }
+             }
+         }
+@@ -1775,6 +1805,64 @@ impl WgpuRendererCore {
+         );
+     }
+ 
++    /// Draw an application-owned texture: a `wgpu::TextureView` on this device.
++    fn draw_external_texture(&self, surface: &gpui::PaintSurface, pass: &mut wgpu::RenderPass<'_>) {
++        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
++        {
++            let Some(view) = surface.texture.0.downcast_ref::<wgpu::TextureView>() else {
++                log::error!("an external texture must be a wgpu::TextureView");
++                return;
++            };
++            let resources = self.resources();
++            let params = SurfaceParams {
++                bounds: surface.bounds.into(),
++                content_mask: surface.content_mask.bounds.into(),
++            };
++            // One small buffer and bind group per texture per frame: applications draw
++            // a handful of these.
++            let locals = resources.device.create_buffer(&wgpu::BufferDescriptor {
++                label: Some("external_texture_locals"),
++                size: std::mem::size_of::<SurfaceParams>() as u64,
++                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++                mapped_at_creation: false,
++            });
++            resources
++                .queue
++                .write_buffer(&locals, 0, bytemuck::bytes_of(&params));
++            let bind_group = resources
++                .device
++                .create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: Some("external_texture"),
++                    layout: &resources.bind_group_layouts.surfaces,
++                    entries: &[
++                        wgpu::BindGroupEntry {
++                            binding: 0,
++                            resource: locals.as_entire_binding(),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 1,
++                            resource: wgpu::BindingResource::TextureView(view),
++                        },
++                        // the layout is the video one (luma and chroma planes); only the first is read
++                        wgpu::BindGroupEntry {
++                            binding: 2,
++                            resource: wgpu::BindingResource::TextureView(view),
++                        },
++                        wgpu::BindGroupEntry {
++                            binding: 3,
++                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
++                        },
++                    ],
++                });
++            pass.set_pipeline(&resources.pipelines.external_textures);
++            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
++            pass.set_bind_group(1, &bind_group, &[]);
++            pass.draw(0..4, 0..1);
++        }
++        #[cfg(any(target_os = "macos", target_os = "ios"))]
++        let _ = (surface, pass);
++    }
++
+     fn draw_sprites(
+         &self,
+         sprite_instances: &InstanceBinding,

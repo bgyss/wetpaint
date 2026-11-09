@@ -7,10 +7,13 @@ through the agent API (`wetpaint::agent::handle`), so the interface holds no pai
 state of its own. It builds for macOS and for the browser on gpui's web platform.
 
 gpui comes from Zed's repository at a pinned revision (the crates.io release is older and
-has no web platform), with Rust 1.98.1 (`rust-toolchain.toml`). This directory is its own
-Cargo workspace, so gpui's dependency tree stays out of the main build.
+has no web platform), with Rust 1.98.1 (`rust-toolchain.toml`) and one patch,
+`patches/external-texture.patch` (below). `./vendor.sh` fetches and patches it into
+`../gpui-vendor/zed`. This directory is its own Cargo workspace, so gpui's dependency
+tree stays out of the main build.
 
 ```
+./vendor.sh                             # once: gpui at the pinned revision, patched
 cargo run --release                     # paint with the mouse (force touch: pressure)
 cargo run --release -- 1600 1200        # canvas size
 cargo run --release -- --demo           # scripted strokes for 12 s, then frame timings on stdout
@@ -32,9 +35,47 @@ of time needs Xcode's Metal toolchain (`xcodebuild -downloadComponent MetalToolc
   moved from `ui.rs` to `app.rs`, and `App::window_gpu` replaced direct `render_state`
   reads.
 
+## The external-texture patch
+
+`patches/external-texture.patch` (170 lines against Zed `c7bea34`) lets an application
+draw a texture it renders itself, on gpui's wgpu renderer:
+
+- `Window::external_gpu()` hands out the renderer's device: for wgpu,
+  `(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)` behind `Box<dyn Any>`, so gpui's core
+  stays free of wgpu. Implemented for the web platform; other renderers return `None`.
+- `Window::paint_external_texture(bounds, ExternalTexture)` adds the texture to the scene
+  as a surface (the primitive macOS uses for video frames). `ExternalTexture` wraps an
+  `Rc<dyn Any>`: a `wgpu::TextureView`, RGBA with straight alpha, sampled as stored.
+- The wgpu renderer draws surfaces with a new `fs_surface_rgba` fragment shader on the
+  video surfaces' vertex shader and bind group layout, which it already had and never used.
+
+The spike asks for the device on its first frame, gives it to the engine
+(`App::external_gpu`), and turns the GPU display on. Each frame the engine composites
+the document into its display texture on that device (`App::gpu_texture`) and gpui draws
+it in the same frame. The **gpu** button in the panel switches between the two paths.
+
+Verified in Chrome on WebGPU (M1 Max, 1024 × 768). With the paint dry:
+
+| display | composite | frame |
+|---|---|---|
+| GPU texture (patched) | 14.5 ms | 25.0 ms (40 fps) |
+| CPU image | 27.5 ms, then gpui's upload | 32.5 ms (31 fps) |
+
+The 14.5 ms left is the engine's, not gpui's: in the browser the simulation runs on the
+CPU, so each layer is still rendered there and uploaded before the GPU composites. While
+three wet strokes spread, the single-threaded simulation (about 160 ms a step) sets the
+frame rate on either path. The browser needs the simulation on the GPU to gain more.
+
+gpui's device was requested with wgpu's downlevel limits, and they were enough for the
+compositor at this size. Larger canvases need larger storage buffers, so an application
+should be able to raise the limits when gpui creates the device.
+
+Not done: the Linux platform (the same renderer; `external_gpu` needs wiring into
+`gpui_linux`'s windows, untested here), and macOS, where gpui draws with Metal.
+
 ## Findings (Zed `c7bea34`, November 2026)
 
-**The canvas goes through the CPU.** gpui draws images from its texture atlas
+**Without the patch, the canvas goes through the CPU.** gpui draws images from its texture atlas
 (`Window::paint_image` with a BGRA `RenderImage`), so each frame the document is
 composited on the CPU, converted to BGRA and uploaded. There is no way to draw a wgpu
 texture the app owns:
@@ -82,12 +123,12 @@ for testing with synthetic events.
 
 ## What would make it the main interface
 
-1. A gpui primitive that draws an external wgpu texture on the wgpu renderer (Linux,
-   web), and access to its `WgpuContext` device, so the simulation and compositor run on
-   gpui's device. Upstreamable.
+1. The external-texture patch above, upstream, with the Linux windows wired and a way
+   to raise the device limits. Then the GPU simulation in the browser, which is the
+   engine's work (the brush reads cells back, and readbacks are asynchronous there).
 2. On macOS, a BGRA `CVPixelBuffer` path in the Metal renderer's surfaces, with the
    compositor rendering into an IOSurface-backed texture through wgpu's Metal interop, or
    wgpu as gpui's macOS renderer.
 3. Pen pressure, tilt and rotation in gpui's input events.
-4. Until then, the CPU path above: fine at 1024 × 768 on the desktop, short of the egui
-   app's GPU display at larger sizes and in the browser.
+4. Until then, on macOS, the CPU path: fine at 1024 × 768, short of the egui app's GPU
+   display at larger sizes.

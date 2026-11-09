@@ -10,14 +10,22 @@ publish = false
 [workspace]
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "c7bea343838f42b4c14151393e41f0bbe033c95e" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c7bea343838f42b4c14151393e41f0bbe033c95e", default-features = false, features = ["runtime_shaders"] }
+# gpui from Zed's tree at c7bea34 with patches/external-texture.patch applied:
+# ./vendor.sh fetches and patches it into ../gpui-vendor/zed.
+gpui = { path = "../gpui-vendor/zed/crates/gpui" }
+gpui_platform = { path = "../gpui-vendor/zed/crates/gpui_platform", default-features = false, features = ["runtime_shaders"] }
 wetpaint = { path = "../../crates/app", default-features = false }
 wet-pigment = { path = "../../crates/pigment" }
 wet-compose = { path = "../../crates/compose" }
 image = { version = "0.25", default-features = false }
 serde_json = "1"
 web-time = "1"
+
+# Where gpui draws with wgpu (not macOS, which is Metal), the canvas is a texture the
+# engine composites on gpui's device.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wgpu = { version = "30", default-features = false }
+wet-fluid-gpu = { path = "../../crates/fluid-gpu" }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen = "=0.2.130"

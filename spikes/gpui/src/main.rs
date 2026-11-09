@@ -73,6 +73,12 @@ struct Wetpaint {
     status: SharedString,
     /// The scripted demo's start, while it runs.
     demo: Option<Instant>,
+    /// The display composited on gpui's GPU device, drawn without a copy.
+    #[cfg(not(target_os = "macos"))]
+    texture: Option<gpui::ExternalTexture>,
+    /// The window's device was asked for (once).
+    #[cfg(not(target_os = "macos"))]
+    gpu_asked: bool,
 }
 
 impl Wetpaint {
@@ -88,6 +94,10 @@ impl Wetpaint {
             stats: Stats::default(),
             status: "".into(),
             demo: None,
+            #[cfg(not(target_os = "macos"))]
+            texture: None,
+            #[cfg(not(target_os = "macos"))]
+            gpu_asked: false,
         }
     }
 
@@ -120,6 +130,24 @@ impl Wetpaint {
         true
     }
 
+    /// Share the window's GPU device with the engine, where gpui's renderer can, and
+    /// composite the display on it.
+    #[cfg(not(target_os = "macos"))]
+    fn share_gpu(&mut self, window: &Window) {
+        if std::mem::replace(&mut self.gpu_asked, true) {
+            return;
+        }
+        let Some(Ok(gpu)) = window.external_gpu().map(|g| g.downcast::<(wgpu::Device, wgpu::Queue, wgpu::AdapterInfo)>()) else {
+            self.status = "gpui's renderer does not share its GPU device".into();
+            return;
+        };
+        let (device, queue, adapter_info) = *gpu;
+        // WebGL has no compute shaders, which the compositor is made of
+        let compute = adapter_info.backend != wgpu::Backend::Gl;
+        self.paint.external_gpu = Some((wet_fluid_gpu::GpuContext { device, queue, adapter_info }, compute));
+        self.call(json!({ "op": "command", "name": "toggle_gpu" }));
+    }
+
     /// Advance the simulation and turn the document into a new image for gpui.
     fn frame(&mut self) {
         let now = Instant::now();
@@ -136,6 +164,20 @@ impl Wetpaint {
         }
         self.paint.tick();
         let t1 = Instant::now();
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.paint.show_gpu();
+            self.texture = self.paint.gpu_texture().map(gpui::ExternalTexture::new);
+            if self.texture.is_some() {
+                if let Some(old) = self.image.take() {
+                    self.stale.borrow_mut().push(old);
+                }
+                Stats::add(&mut self.stats.tick, (t1 - now).as_secs_f32() * 1e3);
+                Stats::add(&mut self.stats.composite, t1.elapsed().as_secs_f32() * 1e3);
+                self.stats.convert = 0.0;
+                return;
+            }
+        }
         let km = self.paint.pigment.then(wet_pigment::KmMixer::new);
         let mut rgba = self.paint.doc.render(km.as_ref().map(|p| p as &dyn wet_compose::PigmentMix));
         let t2 = Instant::now();
@@ -226,6 +268,8 @@ fn button(id: impl Into<SharedString>, text: impl Into<SharedString>, on: bool) 
 
 impl Render for Wetpaint {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(not(target_os = "macos"))]
+        self.share_gpu(window);
         self.frame();
         window.request_animation_frame();
         if self.demo.is_some_and(|s| s.elapsed().as_secs_f32() > DEMO_SECONDS) {
@@ -239,9 +283,14 @@ impl Render for Wetpaint {
         let tilt = self.get("layer.sim.tilt_active") == true;
         let pigment = self.paint.pigment;
         let paused = self.paint.paused;
+        let gpu = self.paint.gpu.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let display = if self.texture.is_some() { "GPU texture" } else { "CPU image" };
+        #[cfg(target_os = "macos")]
+        let display = "CPU image";
         let s = &self.stats;
         let stats = format!(
-            "sim {:.1} ms · {:.0} steps/s\ncomposite {:.1} ms\nto BGRA {:.1} ms\nframe {:.1} ms ({:.0} fps)\npressure {}",
+            "display: {display}\nsim {:.1} ms · {:.0} steps/s\ncomposite {:.1} ms\nto BGRA {:.1} ms\nframe {:.1} ms ({:.0} fps)\npressure {}",
             s.tick,
             self.paint.sim_rate,
             s.composite,
@@ -312,6 +361,7 @@ impl Render for Wetpaint {
                     .child(cmd("tilt", "tilt", tilt, "toggle_tilt"))
                     .child(cmd("pigment", "pigment", pigment, "toggle_pigment"))
                     .child(cmd("pause", "pause", paused, "toggle_pause"))
+                    .child(cmd("gpu", "gpu", gpu, "toggle_gpu"))
                     .child(cmd("dry", "dry", false, "dry_layer"))
                     .child(cmd("clear", "clear", false, "clear_layer"))
                     .child(cmd("undo", "undo", false, "undo")),
@@ -322,6 +372,8 @@ impl Render for Wetpaint {
             .child(div().text_xs().text_color(rgb(0x8a8f9c)).child(self.status.clone()));
 
         let image = self.image.clone();
+        #[cfg(not(target_os = "macos"))]
+        let texture = self.texture.clone();
         let stale = self.stale.clone();
         let canvas_bounds = self.canvas.clone();
         let surface = canvas(
@@ -329,6 +381,11 @@ impl Render for Wetpaint {
             move |bounds, (), window, _| {
                 for old in stale.borrow_mut().drain(..) {
                     let _ = window.drop_image(old);
+                }
+                #[cfg(not(target_os = "macos"))]
+                if let Some(texture) = texture {
+                    window.paint_external_texture(fit(bounds), texture);
+                    return;
                 }
                 if let Some(image) = image {
                     let b = fit(bounds);
