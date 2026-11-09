@@ -350,6 +350,12 @@ impl GpuSim {
         self.gpu_shown = true;
     }
 
+    /// [`Self::composite`], returning a view of the texture that samples it as stored.
+    pub fn composite_view(&mut self, doc: &Document, view: &View) -> wgpu::TextureView {
+        self.composite(doc, view);
+        self.display.as_ref().expect("composited").comp.texture().create_view(&Default::default())
+    }
+
     /// [`Self::composite`], returning the texture registered with the window's renderer.
     #[cfg(feature = "window")]
     pub fn compose(

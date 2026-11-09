@@ -226,6 +226,10 @@ pub struct App {
     /// simulation opens its own device and the display is composited on the CPU).
     #[cfg(feature = "window")]
     pub render_state: Option<egui_wgpu::RenderState>,
+    /// The GPU device of a window another interface draws, and whether it runs compute
+    /// shaders: shared like the egui window's, with the display read by
+    /// [`Self::gpu_texture`].
+    pub external_gpu: Option<(wet_fluid_gpu::GpuContext, bool)>,
     /// Changes whenever a layer may have been edited (commands, strokes, opening), so the
     /// GPU display uploads CPU layers again.
     pub epoch: u64,
@@ -276,6 +280,7 @@ impl App {
             gpu: None,
             #[cfg(feature = "window")]
             render_state: None,
+            external_gpu: None,
             epoch: 0,
             dirty: false,
             quit: false,
@@ -466,12 +471,27 @@ impl App {
     /// shaders (`None` without a window).
     pub fn window_gpu(&self) -> Option<(wet_fluid_gpu::GpuContext, bool)> {
         #[cfg(feature = "window")]
-        return self.render_state.as_ref().map(|r| {
+        if let Some(r) = &self.render_state {
             let ctx = wet_fluid_gpu::GpuContext { device: r.device.clone(), queue: r.queue.clone(), adapter_info: r.adapter.get_info() };
-            (ctx, r.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS))
-        });
-        #[cfg(not(feature = "window"))]
-        None
+            return Some((ctx, r.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)));
+        }
+        self.external_gpu.as_ref().map(|(c, compute)| {
+            (wet_fluid_gpu::GpuContext { device: c.device.clone(), queue: c.queue.clone(), adapter_info: c.adapter_info.clone() }, *compute)
+        })
+    }
+
+    /// Composite the display on the GPU when [`Self::gpu_display_ok`]: a view of the
+    /// RGBA8 texture, sampled as stored (sRGB-encoded), for an interface that draws
+    /// textures on the shared device itself.
+    pub fn gpu_texture(&mut self) -> Option<wgpu::TextureView> {
+        let ok = self.gpu_display_ok();
+        let g = self.gpu.as_mut()?;
+        if !ok {
+            g.shown_on_cpu();
+            return None;
+        }
+        let view = crate::gpu::View { greyscale: self.greyscale, pigment: self.pigment, epoch: self.epoch, painting: self.painting.then_some(self.doc.active) };
+        Some(g.composite_view(&self.doc, &view))
     }
 
     /// Composite the display on the GPU when [`Self::gpu_display_ok`]: the texture to draw.
