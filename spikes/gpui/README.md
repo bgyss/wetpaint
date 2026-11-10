@@ -61,10 +61,20 @@ Verified in Chrome on WebGPU (M1 Max, 1024 × 768). With the paint dry:
 | GPU texture (patched) | 14.5 ms | 25.0 ms (40 fps) |
 | CPU image | 27.5 ms, then gpui's upload | 32.5 ms (31 fps) |
 
-The 14.5 ms left is the engine's, not gpui's: in the browser the simulation runs on the
-CPU, so each layer is still rendered there and uploaded before the GPU composites. While
-three wet strokes spread, the single-threaded simulation (about 160 ms a step) sets the
-frame rate on either path. The browser needs the simulation on the GPU to gain more.
+Those figures are with the simulation on the CPU, as it was in the browser then: each
+layer was rendered there and uploaded before the GPU composited, and while three wet
+strokes spread the single-threaded simulation (about 160 ms a step) held either path to
+6 fps.
+
+The engine now simulates on the GPU in the browser too (its readbacks no longer block:
+see `crates/app/src/gpu.rs`), and with the texture drawn in place nothing of a wet
+layer crosses to the CPU each frame. Same page, same three wet strokes:
+
+| | simulation | composite | frame |
+|---|---|---|---|
+| GPU simulation, GPU texture | 0.8 ms | 1.3 ms | 8.9 ms (113 fps) |
+| while painting over wet paint | 7.3 ms | 1.3 ms | 17.1 ms (59 fps) |
+| CPU simulation, GPU texture (before) | 161 ms | 11 ms | 173 ms (6 fps) |
 
 gpui's device was requested with wgpu's downlevel limits, and they were enough for the
 compositor at this size. Larger canvases need larger storage buffers, so an application
@@ -124,8 +134,7 @@ for testing with synthetic events.
 ## What would make it the main interface
 
 1. The external-texture patch above, upstream, with the Linux windows wired and a way
-   to raise the device limits. Then the GPU simulation in the browser, which is the
-   engine's work (the brush reads cells back, and readbacks are asynchronous there).
+   to raise the device limits.
 2. On macOS, a BGRA `CVPixelBuffer` path in the Metal renderer's surfaces, with the
    compositor rendering into an IOSurface-backed texture through wgpu's Metal interop, or
    wgpu as gpui's macOS renderer.

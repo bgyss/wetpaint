@@ -71,6 +71,8 @@ struct Wetpaint {
     pressure: Option<f32>,
     stats: Stats,
     status: SharedString,
+    /// Requests that read or edit layers, waiting for them to come back from the GPU.
+    requests: std::collections::VecDeque<Value>,
     /// The scripted demo's start, while it runs.
     demo: Option<Instant>,
     /// The display composited on gpui's GPU device, drawn without a copy.
@@ -93,6 +95,7 @@ impl Wetpaint {
             pressure: None,
             stats: Stats::default(),
             status: "".into(),
+            requests: Default::default(),
             demo: None,
             #[cfg(not(target_os = "macos"))]
             texture: None,
@@ -110,6 +113,16 @@ impl Wetpaint {
             self.status = s.to_owned().into();
         }
         r
+    }
+
+    /// An agent request from the panel. One that reads or edits layers waits its turn:
+    /// in the browser the GPU hands layers back a frame or two after it is asked.
+    fn request(&mut self, req: Value) {
+        if agent::needs_layers(&req) || !self.requests.is_empty() {
+            self.requests.push_back(req);
+        } else {
+            self.call(req);
+        }
     }
 
     fn get(&mut self, key: &str) -> Value {
@@ -161,6 +174,10 @@ impl Wetpaint {
         }
         if let Some(start) = self.demo {
             self.demo_step(start.elapsed().as_secs_f32());
+        }
+        while !self.requests.is_empty() && self.paint.settle() {
+            let req = self.requests.pop_front().expect("checked");
+            self.call(req);
         }
         self.paint.tick();
         let t1 = Instant::now();
@@ -302,7 +319,7 @@ impl Render for Wetpaint {
 
         let tools = div().flex().flex_wrap().gap_1().children(TOOLS.iter().map(|&t| {
             button(format!("tool-{t}"), t, t == tool).on_click(cx.listener(move |this, _, _, _| {
-                this.call(json!({ "op": "set", "key": "brush.tool", "value": t }));
+                this.request(json!({ "op": "set", "key": "brush.tool", "value": t }));
             }))
         }));
         let palette = div().flex().flex_wrap().gap_1().children(PALETTE.iter().map(|&c| {
@@ -317,12 +334,12 @@ impl Render for Wetpaint {
                 .border_color(if on { rgb(0xffffff) } else { rgb(0x1b1d24) })
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, _| {
-                    this.call(json!({ "op": "set", "key": "brush.color", "value": hex }));
+                    this.request(json!({ "op": "set", "key": "brush.color", "value": hex }));
                 }))
         }));
         let cmd = |id: &str, text: &str, on: bool, name: &'static str| {
             button(id.to_owned(), text.to_owned(), on).on_click(cx.listener(move |this, _, _, _| {
-                this.call(json!({ "op": "command", "name": name }));
+                this.request(json!({ "op": "command", "name": name }));
             }))
         };
         let sizes = div()
@@ -330,11 +347,11 @@ impl Render for Wetpaint {
             .items_center()
             .gap_2()
             .child(button("size-down", "−", false).on_click(cx.listener(|this, _, _, _| {
-                this.call(json!({ "op": "command", "name": "size_by", "args": { "factor": 0.8 } }));
+                this.request(json!({ "op": "command", "name": "size_by", "args": { "factor": 0.8 } }));
             })))
             .child(div().text_sm().text_color(rgb(0xe8eaf0)).child(format!("{size_v:.0} px")))
             .child(button("size-up", "+", false).on_click(cx.listener(|this, _, _, _| {
-                this.call(json!({ "op": "command", "name": "size_by", "args": { "factor": 1.25 } }));
+                this.request(json!({ "op": "command", "name": "size_by", "args": { "factor": 1.25 } }));
             })));
 
         let panel = div()
