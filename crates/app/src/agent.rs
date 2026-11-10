@@ -83,6 +83,27 @@ pub fn headless(w: usize, h: usize) -> App {
     app
 }
 
+/// Does `request` read or edit layers? Where GPU readbacks cannot block (the browser),
+/// such a request waits until [`App::settle`] says the layers are back; the others can
+/// be answered at once.
+pub fn needs_layers(request: &Value) -> bool {
+    let brush = |k: &str| k.starts_with("brush.");
+    match request.get("op").and_then(Value::as_str) {
+        Some("describe" | "state" | "get" | "presets" | "history") => false,
+        Some("set") => match (request.get("values"), request.get("key").and_then(Value::as_str)) {
+            (Some(Value::Object(m)), _) => !m.keys().all(|k| brush(k)),
+            (None, Some(k)) => !brush(k),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+/// [`needs_layers`] for a request line (false when it does not parse: the reply says so).
+pub fn line_needs_layers(line: &str) -> bool {
+    serde_json::from_str::<Value>(line).is_ok_and(|r| needs_layers(&r))
+}
+
 /// An op: name, what it does, and its arguments (name, JSON type, meaning).
 pub struct Op {
     pub name: &'static str,
@@ -1681,7 +1702,10 @@ fn set(app: &mut App, a: &Value) -> R<Value> {
         (None, Some(k)) => vec![(str_of(k)?.to_owned(), a.get("value").cloned().unwrap_or(Value::Null))],
         _ => return Err("set needs key and value, or values".into()),
     };
-    app.release_gpu();
+    // brush settings leave the layers where they are
+    if !pairs.iter().all(|(k, _)| k.starts_with("brush.")) {
+        app.release_gpu();
+    }
     app.epoch += 1;
     for (k, v) in &pairs {
         set_one(app, k, v, li, gi).map_err(|e| format!("{k}: {e}"))?;

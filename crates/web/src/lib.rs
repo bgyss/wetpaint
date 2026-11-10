@@ -100,7 +100,14 @@ fn named(key: egui::Key) -> Option<NamedKey> {
 impl eframe::App for WebApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        for (request, resolve) in AGENT.with_borrow_mut(std::mem::take) {
+        // a request that reads or edits layers waits until they are back from the GPU
+        // (and those behind it wait their turn)
+        let mut requests = AGENT.with_borrow_mut(std::mem::take).into_iter();
+        while let Some((request, resolve)) = requests.next() {
+            if wetpaint::agent::line_needs_layers(&request) && !self.app.settle() {
+                AGENT.with_borrow_mut(|q| q.splice(0..0, std::iter::once((request, resolve)).chain(requests)).for_each(drop));
+                break;
+            }
             let reply = wetpaint::agent::handle_line(&mut self.app, &request);
             let _ = resolve.call1(&JsValue::NULL, &JsValue::from_str(&reply));
         }

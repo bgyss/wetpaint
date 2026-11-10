@@ -36,7 +36,9 @@ the platform's application data folder (`~/Library/Application Support` on macOS
 ## In the browser
 
 `crates/web` runs the same app in a browser with eframe: WebGPU when the browser has it
-(the display is composited on the GPU, the simulation runs on the CPU), WebGL otherwise.
+(the simulation and the display run on the GPU), WebGL otherwise (on the CPU). A browser
+cannot wait for the GPU, so there a stroke's cells and the layers a command needs come
+back a frame or two after they are asked for, and the input waits for them.
 
 ```
 rustup target add wasm32-unknown-unknown

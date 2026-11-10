@@ -7,6 +7,12 @@
 //! save) [`GpuSim::release`] brings every layer back in full. Layers the GPU backend does
 //! not cover step on the CPU as before: the layer being painted and pigment-mixing layers
 //! (the GPU mixes normally only).
+//!
+//! Where GPU readbacks cannot block (the browser), [`GpuSim::deferred`] is set and nothing
+//! here waits: a release is asked for ([`GpuSim::request_release`]) and arrives a frame or
+//! two later ([`GpuSim::pump`]), with the layer's steps held meanwhile, and a stroke's
+//! cells come back the same way ([`GpuSim::request_region`]). The app queues its input
+//! until the layers it needs are back (`App::pump`).
 
 use rayon::prelude::*;
 use wet_doc::Document;
@@ -77,10 +83,26 @@ pub struct GpuSim {
     /// A stroke's undo step on its way from the GPU: the layer and the label.
     pending: Option<(usize, String)>,
     pub adapter: String,
-    /// Step wet layers on the GPU; when false the GPU only composites the display. The web
-    /// starts without it: its GPU readbacks cannot block, which strokes on GPU-held layers
-    /// rely on.
+    /// Step wet layers on the GPU; when false the GPU only composites the display.
     pub simulate: bool,
+    /// GPU readbacks cannot block (the browser): see the module documentation.
+    pub deferred: bool,
+    /// Layers on their way back to the CPU ([`Self::request_release`]).
+    releasing: Vec<bool>,
+    /// The app is waiting for layers to come back: wet layers on the CPU stay there,
+    /// unstepped, so a layer that has arrived is not sent off again before the rest.
+    pub hold: bool,
+    /// Readbacks that waited for the GPU, and releases that could not wait and kept the
+    /// CPU copy as it was (deferred mode); for tests.
+    pub waits: usize,
+    pub stale: usize,
+}
+
+/// The layers a release covers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Scope {
+    All,
+    Layer(usize),
 }
 
 impl GpuSim {
@@ -105,7 +127,12 @@ impl GpuSim {
             frame: 0,
             pending: None,
             adapter,
-            simulate: !cfg!(target_arch = "wasm32"),
+            simulate: true,
+            deferred: cfg!(target_arch = "wasm32"),
+            releasing: vec![false; n],
+            hold: false,
+            waits: 0,
+            stale: 0,
         })
     }
 
@@ -115,6 +142,90 @@ impl GpuSim {
         self.fresh.resize(n, false);
         self.gran.resize(n, (0, 0));
         self.stepped.resize(n, false);
+        self.releasing.resize(n, false);
+    }
+
+    /// Bring held layer `i` back in full, now. Where that cannot wait, a download that
+    /// has arrived is used, or else the CPU copy stays as it was.
+    fn bring_back(&mut self, doc: &mut Document, i: usize) {
+        if let (Some(Some(g)), Some(l)) = (self.layers.get_mut(i), doc.layers.get_mut(i)) {
+            if !self.deferred {
+                g.download(&mut l.wet);
+                self.waits += 1;
+            } else if !g.take_download(&mut l.wet) {
+                self.stale += 1;
+            }
+        }
+        self.owns[i] = false;
+        self.fresh[i] = false;
+        self.releasing[i] = false;
+    }
+
+    fn in_scope(scope: Scope, i: usize) -> bool {
+        scope == Scope::All || scope == Scope::Layer(i)
+    }
+
+    /// Have the layers of `scope` all come back, with nothing of theirs on its way (a
+    /// download, a stroke's cells, an undo step)?
+    pub fn settled(&self, scope: Scope) -> bool {
+        let busy = |i: usize| self.owns[i] || self.layers[i].as_ref().is_some_and(|g| g.region_pending() || g.download_pending());
+        self.pending.is_none() && (0..self.owns.len()).filter(|&i| Self::in_scope(scope, i)).all(|i| !busy(i))
+    }
+
+    /// Ask for the held layers of `scope` to come back without waiting: [`Self::pump`]
+    /// brings them in as they arrive.
+    pub fn request_release(&mut self, scope: Scope) {
+        for i in 0..self.owns.len() {
+            if self.owns[i] && Self::in_scope(scope, i) {
+                self.releasing[i] = true;
+            }
+        }
+    }
+
+    /// Is layer `i` on its way back to the CPU?
+    pub fn releasing(&self, i: usize) -> bool {
+        self.releasing.get(i).copied().unwrap_or(false)
+    }
+
+    /// Take what has arrived from the GPU: undo steps and released layers. Called every
+    /// frame before input is handled.
+    pub fn pump(&mut self, doc: &mut Document) {
+        self.fit(doc.layers.len());
+        self.flush_snapshot(doc, false);
+        for i in 0..doc.layers.len() {
+            if !self.releasing[i] {
+                continue;
+            }
+            let Some(g) = self.layers[i].as_mut().filter(|_| self.owns[i]) else {
+                self.releasing[i] = false;
+                continue;
+            };
+            // a stroke's cells go back to the GPU before the layer leaves it
+            if g.region_pending() {
+                continue;
+            }
+            if g.take_download(&mut doc.layers[i].wet) {
+                self.owns[i] = false;
+                self.fresh[i] = false;
+                self.releasing[i] = false;
+                self.stepped[i] = true;
+            } else if !g.download_pending() {
+                g.request_download();
+            }
+        }
+    }
+
+    /// Start bringing the cells of `rect` of held layer `i` back for the brush, without
+    /// waiting ([`Self::take_region`]). The layer is not stepped until they are written back.
+    pub fn request_region(&mut self, i: usize, rect: wet_fluid_gpu::Rect) -> bool {
+        self.layers.get_mut(i).and_then(|g| g.as_mut()).is_some_and(|g| g.request_region(rect))
+    }
+
+    /// The cells [`Self::request_region`] asked for, in the document's copy, once they
+    /// have arrived.
+    pub fn take_region(&mut self, doc: &mut Document, i: usize) -> Option<wet_fluid_gpu::Rect> {
+        let (Some(Some(g)), Some(l)) = (self.layers.get_mut(i), doc.layers.get_mut(i)) else { return None };
+        g.take_region(&mut l.wet)
     }
 
     /// Is any layer's state on the GPU only?
@@ -141,11 +252,7 @@ impl GpuSim {
     pub fn release_layer(&mut self, doc: &mut Document, i: usize) {
         self.flush_snapshot(doc, true);
         if self.owns.get(i).copied().unwrap_or(false) {
-            if let (Some(Some(g)), Some(l)) = (self.layers.get_mut(i), doc.layers.get_mut(i)) {
-                g.download(&mut l.wet);
-            }
-            self.owns[i] = false;
-            self.fresh[i] = false;
+            self.bring_back(doc, i);
         }
     }
 
@@ -156,12 +263,13 @@ impl GpuSim {
         for i in 0..doc.layers.len() {
             let wet = &doc.layers[i].wet;
             let gpu_ok = self.simulate && Some(i) != skip && wet.pigment.is_none();
+            // a layer on its way back, or with a stroke's cells out, keeps its state
+            if self.owns[i] && (self.releasing[i] || self.layers[i].as_ref().is_some_and(|g| g.region_pending())) {
+                continue;
+            }
             if !gpu_ok {
                 if self.owns[i] {
-                    if let Some(g) = &mut self.layers[i] {
-                        g.download(&mut doc.layers[i].wet);
-                    }
-                    self.owns[i] = false;
+                    self.bring_back(doc, i);
                 }
                 for _ in 0..n {
                     doc.layers[i].wet.step();
@@ -177,6 +285,9 @@ impl GpuSim {
                     }
                     continue;
                 }
+                if self.hold {
+                    continue;
+                }
                 let reuse = self.layers[i].as_ref().is_some_and(|g| g.w == wet.w && g.h == wet.h) && self.gran[i] == gran_key(wet);
                 if reuse {
                     let g = self.layers[i].as_mut().expect("checked");
@@ -185,6 +296,9 @@ impl GpuSim {
                 } else {
                     self.layers[i] = Some(GpuLayer::upload_on(&self.ctx, wet));
                     self.gran[i] = gran_key(wet);
+                }
+                if let Some(g) = &mut self.layers[i] {
+                    g.deferred = self.deferred;
                 }
                 self.owns[i] = true;
             }
@@ -216,8 +330,12 @@ impl GpuSim {
             if g.take_display(l, false) {
                 let wet = l.water.cur().data.par_iter().any(|v| v.to_f32() > 0.0) || l.dens.amount.cur().data.par_iter().any(|&v| v > 0.0);
                 if !wet && !self.fresh[i] {
-                    g.download(l);
-                    self.owns[i] = false;
+                    if self.deferred {
+                        self.releasing[i] = true;
+                    } else {
+                        g.download(l);
+                        self.owns[i] = false;
+                    }
                     continue;
                 }
             }
@@ -232,8 +350,10 @@ impl GpuSim {
     pub fn begin_stroke(&mut self, doc: &mut Document, i: usize, label: &str) {
         self.flush_snapshot(doc, true);
         if let Some(Some(g)) = self.layers.get_mut(i) {
-            g.request_snapshot();
-            self.pending = Some((i, label.to_owned()));
+            // (an undo step still on its way takes this stroke in too)
+            if g.request_snapshot() {
+                self.pending = Some((i, label.to_owned()));
+            }
         }
     }
 
@@ -245,7 +365,7 @@ impl GpuSim {
             self.pending = None;
             return;
         };
-        if let Some(s) = g.take_snapshot(wait) {
+        if let Some(s) = g.take_snapshot(wait && !self.deferred) {
             doc.checkpoint_planes(*i, label, s.h16, s.f32s, s.open);
             self.pending = None;
         }
@@ -256,6 +376,7 @@ impl GpuSim {
     pub fn read_region(&mut self, doc: &mut Document, i: usize, rect: wet_fluid_gpu::Rect) {
         if let (Some(Some(g)), Some(l)) = (self.layers.get_mut(i), doc.layers.get_mut(i)) {
             g.read_region(&mut l.wet, rect);
+            self.waits += 1;
         }
     }
 
@@ -425,4 +546,98 @@ impl GpuSim {
 
 fn gran_key(l: &wet_fluid::WetLayer) -> (usize, usize) {
     l.maps.gran.as_ref().map_or((0, 0), |g| (g.data.as_ptr() as usize, g.data.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::{App, Cmd};
+    use wet_doc::filters::Filter;
+
+    /// Two strokes (the second on a layer the GPU holds), then a command; `deferred`:
+    /// as where readbacks cannot block. Returns the painting before the command, the
+    /// undo labels, and how often the GPU was waited for or a stale copy was used.
+    fn paint(deferred: bool) -> Option<(Vec<u8>, Vec<String>, (usize, usize))> {
+        let mut app = App::new(256, 192);
+        app.run(Cmd::ToggleGpu);
+        app.gpu.as_mut()?.deferred = deferred;
+        // a frame, and the time one takes: the GPU finishes its work meanwhile
+        fn frame(app: &mut App, steps: usize) {
+            app.frame(steps);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let stroke = |app: &mut App, y: f32| {
+            app.cursor = (40.0, y);
+            app.press();
+            let on_gpu = app.gpu_stroke;
+            frame(app, 1);
+            for k in 1..=12 {
+                app.cursor = (40.0 + 14.0 * k as f32, y + 3.0 * k as f32);
+                app.moved();
+                frame(app, 1);
+            }
+            app.release();
+            // (a stroke on the GPU ends once its last cells are back)
+            for _ in 0..200 {
+                if !app.painting {
+                    break;
+                }
+                frame(app, 1);
+            }
+            assert!(!app.painting, "the stroke ended: {}", app.debug_state());
+            on_gpu
+        };
+        assert!(!stroke(&mut app, 50.0), "a dry layer is painted on the CPU");
+        for _ in 0..3 {
+            frame(&mut app, 1);
+        }
+        assert!(app.gpu.as_ref()?.holds(0), "the wet layer steps on the GPU");
+        assert!(stroke(&mut app, 110.0), "the second stroke paints it there");
+        assert!(app.gpu.as_ref()?.holds(0));
+        for _ in 0..3 {
+            frame(&mut app, 1);
+        }
+        // the layers come back before anything reads them
+        for _ in 0..200 {
+            if app.settle() {
+                break;
+            }
+            frame(&mut app, 0);
+        }
+        assert!(app.settle());
+        let image = app.doc.render(None);
+        frame(&mut app, 1);
+        // a command waits for the layer the GPU took again
+        app.run(Cmd::Filter(Filter::Invert));
+        for _ in 0..200 {
+            if app.doc.history().0.len() == 3 {
+                break;
+            }
+            frame(&mut app, 1);
+        }
+        let labels = app.doc.history().0.iter().map(|s| s.0.to_owned()).collect();
+        let g = app.gpu.as_ref()?;
+        Some((image, labels, (g.waits, g.stale)))
+    }
+
+    #[test]
+    fn where_the_gpu_cannot_be_waited_for_nothing_waits() {
+        let Some((image, labels, counts)) = paint(true) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        assert_eq!(counts, (0, 0), "no blocking readback, no stale release");
+        assert_eq!(labels, ["Watercolor stroke", "Watercolor stroke", "Invert"]);
+        let (reference, _, waited) = paint(false).expect("an adapter");
+        assert!(waited.0 > 0, "the reference run waits for the GPU");
+        // both strokes are there, as in the run that waits (the paint flows a few steps
+        // more or less, so the cells differ a little)
+        let blank = wet_doc::Document::new(256, 192).render(None);
+        let painted = |img: &[u8]| img.chunks_exact(4).zip(blank.chunks_exact(4)).filter(|(a, b)| a != b).count() as f32;
+        let (a, b) = (painted(&image), painted(&reference));
+        assert!(a > 2000.0 && (a / b - 1.0).abs() < 0.1, "painted cells: {a} deferred, {b} waiting");
+        let at = |img: &[u8], x: usize, y: usize| img[(y * 256 + x) * 4..][..3].to_vec();
+        for (x, y) in [(124, 68), (124, 128)] {
+            assert_ne!(at(&image, x, y), at(&blank, x, y), "paint at ({x}, {y})");
+        }
+    }
 }

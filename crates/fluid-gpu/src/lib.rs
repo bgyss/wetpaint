@@ -191,6 +191,15 @@ pub struct GpuLayer {
     region_bgl: wgpu::BindGroupLayout,
     region_pipelines: (wgpu::ComputePipeline, wgpu::ComputePipeline),
     region: Option<Region>,
+    /// The region readback that does not wait ([`Self::request_region`]): its state and
+    /// rectangle.
+    region_state: Arc<AtomicU8>,
+    region_rect: Option<Rect>,
+    /// The full download that does not wait ([`Self::request_download`]), in `readback`.
+    download_state: Arc<AtomicU8>,
+    /// Readbacks cannot block here (the browser): one that is outstanding when its buffer
+    /// is needed again is cancelled, not waited for.
+    pub deferred: bool,
     /// The undo snapshot copy in `readback` ([`Self::request_snapshot`]), and one that was
     /// finished early because a download needed the buffer.
     snap_state: Arc<AtomicU8>,
@@ -425,6 +434,10 @@ impl GpuLayer {
             region_bgl,
             region_pipelines,
             region: None,
+            region_state: Arc::new(AtomicU8::new(DISPLAY_IDLE)),
+            region_rect: None,
+            download_state: Arc::new(AtomicU8::new(DISPLAY_IDLE)),
+            deferred: cfg!(target_arch = "wasm32"),
             snap_state: Arc::new(AtomicU8::new(DISPLAY_IDLE)),
             snap_ready: None,
             snap_thread: None,
@@ -699,6 +712,54 @@ impl GpuLayer {
     /// layers, the wet mask) into `layer`, waiting for the steps submitted so far. The rest
     /// of `layer` is left as it was.
     pub fn read_region(&mut self, layer: &mut WetLayer, rect: Rect) {
+        let bytes = self.submit_region(rect);
+        self.region.as_ref().expect("region buffers").staging.slice(..bytes).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.wait();
+        self.unpack_region(layer, rect);
+    }
+
+    /// Start [`Self::read_region`] without waiting ([`Self::take_region`] finishes it).
+    /// Returns false while an earlier request is outstanding. The layer must not be
+    /// stepped until the region has been taken and written back.
+    pub fn request_region(&mut self, rect: Rect) -> bool {
+        if self.region_rect.is_some() {
+            return false;
+        }
+        let bytes = self.submit_region(rect);
+        let state = Arc::new(AtomicU8::new(DISPLAY_PENDING));
+        self.region_state = state.clone();
+        self.region.as_ref().expect("region buffers").staging.slice(..bytes).map_async(wgpu::MapMode::Read, move |r| {
+            state.store(if r.is_ok() { DISPLAY_READY } else { DISPLAY_IDLE }, Ordering::Release);
+        });
+        self.region_rect = Some(rect);
+        true
+    }
+
+    /// Is a [`Self::request_region`] outstanding?
+    pub fn region_pending(&self) -> bool {
+        self.region_rect.is_some()
+    }
+
+    /// Copy the region [`Self::request_region`] asked for into `layer` once it has
+    /// arrived: its rectangle, or `None` while it is on its way.
+    pub fn take_region(&mut self, layer: &mut WetLayer) -> Option<Rect> {
+        let rect = self.region_rect?;
+        if self.region_state.load(Ordering::Acquire) == DISPLAY_PENDING {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
+        match self.region_state.load(Ordering::Acquire) {
+            DISPLAY_PENDING => return None,
+            DISPLAY_READY => self.unpack_region(layer, rect),
+            // the mapping failed: `layer` keeps what it had
+            _ => {}
+        }
+        self.region_state.store(DISPLAY_IDLE, Ordering::Release);
+        self.region_rect = None;
+        Some(rect)
+    }
+
+    /// Pack `rect` and copy it to the staging buffer: the bytes to map.
+    fn submit_region(&mut self, rect: Rect) -> u64 {
         let (rw, rh) = (rect.2 - rect.0 + 1, rect.3 - rect.1 + 1);
         let rn = rw * rh;
         self.region_buffers(REGION_FLOATS * rn);
@@ -708,9 +769,15 @@ impl GpuLayer {
         let bytes = (REGION_FLOATS * rn * 4) as u64;
         enc.copy_buffer_to_buffer(&region.packed, 0, &region.staging, 0, bytes);
         self.queue.submit([enc.finish()]);
-        let slice = region.staging.slice(..bytes);
-        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.wait();
+        bytes
+    }
+
+    /// Copy `rect` from the mapped staging buffer into `layer`, and unmap it.
+    fn unpack_region(&self, layer: &mut WetLayer, rect: Rect) {
+        let (rw, rh) = (rect.2 - rect.0 + 1, rect.3 - rect.1 + 1);
+        let rn = rw * rh;
+        let region = self.region.as_ref().expect("region buffers");
+        let slice = region.staging.slice(..(REGION_FLOATS * rn * 4) as u64);
         {
             let data = slice.get_mapped_range().expect("map region");
             let all: &[f32] = bytemuck::cast_slice(&data);
@@ -790,10 +857,15 @@ impl GpuLayer {
     }
 
     /// Start copying the planes an undo step restores, as of the work submitted so far,
-    /// without waiting ([`Self::take_snapshot`] collects them).
-    pub fn request_snapshot(&mut self) {
+    /// without waiting ([`Self::take_snapshot`] collects them). Returns whether a snapshot
+    /// is on its way.
+    pub fn request_snapshot(&mut self) -> bool {
         if self.snapshot_pending() {
-            return;
+            return true;
+        }
+        // the readback buffer is busy with a download
+        if self.download_state.load(Ordering::Acquire) != DISPLAY_IDLE {
+            return false;
         }
         let n = self.w * self.h;
         let bytes = (n * 4) as u64;
@@ -810,6 +882,7 @@ impl GpuLayer {
         self.readback.slice(..14 * bytes).map_async(wgpu::MapMode::Read, move |r| {
             state.store(if r.is_ok() { DISPLAY_READY } else { DISPLAY_IDLE }, Ordering::Release);
         });
+        true
     }
 
     /// Is an undo snapshot requested and not yet taken?
@@ -903,8 +976,8 @@ impl GpuLayer {
             enc.copy_buffer_to_buffer(&self.planes, slot as u64 * bytes, &self.display, i as u64 * bytes, bytes);
         }
         self.queue.submit([enc.finish()]);
-        self.display_state.store(DISPLAY_PENDING, Ordering::Release);
-        let state = self.display_state.clone();
+        let state = Arc::new(AtomicU8::new(DISPLAY_PENDING));
+        self.display_state = state.clone();
         self.display.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             state.store(if r.is_ok() { DISPLAY_READY } else { DISPLAY_IDLE }, Ordering::Release);
         });
@@ -947,6 +1020,14 @@ impl GpuLayer {
     /// Drop an outstanding display request (its planes may predate a
     /// [`Self::write_state`]).
     pub fn discard_display(&mut self) {
+        if self.deferred {
+            // cancel it: its callback keeps the state it was given
+            if self.display_state.load(Ordering::Acquire) != DISPLAY_IDLE {
+                self.display.unmap();
+                self.display_state = Arc::new(AtomicU8::new(DISPLAY_IDLE));
+            }
+            return;
+        }
         match self.display_state.load(Ordering::Acquire) {
             DISPLAY_PENDING => {
                 let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -966,15 +1047,68 @@ impl GpuLayer {
         if self.snap_thread.is_some() || self.snap_state.load(Ordering::Acquire) != DISPLAY_IDLE {
             self.snap_ready = self.take_snapshot(true);
         }
-        let n = self.w * self.h;
-        let bytes = (n * 4) as u64;
+        let len = self.submit_download();
+        self.readback.slice(..len).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        self.wait();
+        self.unpack_download(layer);
+    }
+
+    /// Start [`Self::download`] without waiting ([`Self::take_download`] finishes it).
+    /// Returns false while the readback buffer is busy with an undo snapshot. The layer
+    /// must not be stepped until the download has been taken.
+    pub fn request_download(&mut self) -> bool {
+        if self.download_state.load(Ordering::Acquire) != DISPLAY_IDLE {
+            return true;
+        }
+        if self.snap_thread.is_some() || self.snap_state.load(Ordering::Acquire) != DISPLAY_IDLE {
+            match self.take_snapshot(false) {
+                Some(s) => self.snap_ready = Some(s),
+                None => return false,
+            }
+        }
+        let len = self.submit_download();
+        let state = Arc::new(AtomicU8::new(DISPLAY_PENDING));
+        self.download_state = state.clone();
+        self.readback.slice(..len).map_async(wgpu::MapMode::Read, move |r| {
+            state.store(if r.is_ok() { DISPLAY_READY } else { DISPLAY_IDLE }, Ordering::Release);
+        });
+        true
+    }
+
+    /// Is a [`Self::request_download`] outstanding?
+    pub fn download_pending(&self) -> bool {
+        self.download_state.load(Ordering::Acquire) != DISPLAY_IDLE
+    }
+
+    /// Copy a finished [`Self::request_download`] into `layer`. Returns whether `layer`
+    /// was updated.
+    pub fn take_download(&mut self, layer: &mut WetLayer) -> bool {
+        if self.download_state.load(Ordering::Acquire) == DISPLAY_PENDING {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+        }
+        if self.download_state.load(Ordering::Acquire) != DISPLAY_READY {
+            return false;
+        }
+        self.unpack_download(layer);
+        self.download_state.store(DISPLAY_IDLE, Ordering::Release);
+        true
+    }
+
+    /// The plane slots a download reads: the current half of each double-buffered plane,
+    /// and the single planes the CPU step reads back (acc_b is scratch).
+    fn download_slots(&self) -> [usize; 18] {
         let (vel, wd, mid) = (self.vel as usize, self.wd as usize, self.mid as usize);
-        // the current half of each double-buffered plane, and the single planes the CPU
-        // step reads back (acc_b is scratch)
-        let slots = [
+        [
             vel, 2 + vel, 4 + wd, 6 + wd, 8 + wd, 10 + wd, 16 + mid, 18 + mid, 20 + mid,
             12 + wd, 14 + wd, 22 + mid, 24 + mid, 26, 27, 28, 30, 31,
-        ];
+        ]
+    }
+
+    /// Copy the planes, the wet mask and the drip to the readback buffer: the bytes to map.
+    fn submit_download(&mut self) -> u64 {
+        let n = self.w * self.h;
+        let bytes = (n * 4) as u64;
+        let slots = self.download_slots();
         let mut enc = self.device.create_command_encoder(&Default::default());
         for (i, &slot) in slots.iter().enumerate() {
             enc.copy_buffer_to_buffer(&self.planes, slot as u64 * bytes, &self.readback, i as u64 * bytes, bytes);
@@ -983,9 +1117,14 @@ impl GpuLayer {
         enc.copy_buffer_to_buffer(&self.maps, bytes, &self.readback, open_at, bytes);
         enc.copy_buffer_to_buffer(&self.drip, 0, &self.readback, drip_at, (DRIP_FLOATS * 4) as u64);
         self.queue.submit([enc.finish()]);
-        let slice = self.readback.slice(..drip_at + (DRIP_FLOATS * 4) as u64);
-        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.wait();
+        drip_at + (DRIP_FLOATS * 4) as u64
+    }
+
+    /// Copy the mapped readback buffer into `layer`, and unmap it.
+    fn unpack_download(&mut self, layer: &mut WetLayer) {
+        let n = self.w * self.h;
+        let slots = self.download_slots();
+        let slice = self.readback.slice(..((slots.len() + 1) * n * 4 + DRIP_FLOATS * 4) as u64);
         {
             let data = slice.get_mapped_range().expect("map readback");
             let all: &[f32] = bytemuck::cast_slice(&data);

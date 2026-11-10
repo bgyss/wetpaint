@@ -126,7 +126,31 @@ pub enum Cmd {
     ExportHeightmap,
 }
 
+/// Input waiting for layers to come back from the GPU ([`App::pump`]), with the pointer
+/// state it arrived with.
+struct Deferred {
+    input: Input,
+    cursor: (f32, f32),
+    pressure: Option<f32>,
+    free_corner: bool,
+}
+
+enum Input {
+    Press,
+    Move,
+    Release,
+    Cmd(Cmd),
+}
+
 impl Cmd {
+    /// Does the command leave every layer alone (so layers the GPU holds can stay there)?
+    fn brush_only(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Tool(_) | Cmd::CycleLiquify | Cmd::NextColor | Cmd::SizeBy(_) | Cmd::WaterBy(_) | Cmd::OpacityBy(_) | Cmd::Volume(_) | Cmd::ToggleMulti | Cmd::Fit
+        )
+    }
+
     /// Does the command change the document (so it needs saving)? Tool, brush, view and
     /// file commands do not.
     fn edits_document(&self) -> bool {
@@ -198,6 +222,15 @@ pub struct App {
     pub gpu_stroke: bool,
     /// Brush steps not yet stamped: a stroke on the GPU stamps a frame's steps together.
     queued: Vec<Sample>,
+    /// Where GPU readbacks cannot block: input waiting for layers to come back.
+    backlog: std::collections::VecDeque<Deferred>,
+    /// The cells of a stroke on a GPU-held layer are on their way back: how many of the
+    /// queued steps they cover, and whether the last of those ends the stroke.
+    region_wait: Option<(usize, bool)>,
+    /// The pointer was released; the stroke ends once its last steps are stamped.
+    stroke_ending: bool,
+    /// An interface is waiting for every layer to come back ([`App::settle`]).
+    settling: bool,
     /// Canvas position under the pointer.
     pub cursor: (f32, f32),
     pub paused: bool,
@@ -265,6 +298,10 @@ impl App {
             painting: false,
             gpu_stroke: false,
             queued: Vec::new(),
+            backlog: Default::default(),
+            region_wait: None,
+            stroke_ending: false,
+            settling: false,
             cursor: (0.0, 0.0),
             paused: false,
             pigment: false,
@@ -419,19 +456,214 @@ impl App {
         self.last_step = now;
         if self.paused {
             self.sim_rate = 0.0;
+            self.frame(0);
             return;
         }
         self.debt = (self.debt + dt * STEPS_PER_SECOND).min(4.0);
         let steps = self.debt.floor() as usize;
         self.debt -= steps as f32;
         self.steps_this_second.0 += steps as u32;
-        if steps > 0 {
-            self.step_sim(steps);
-        }
+        self.frame(steps);
         let elapsed = self.steps_this_second.1.elapsed().as_secs_f32();
         if elapsed >= 1.0 {
             self.sim_rate = self.steps_this_second.0 as f32 / elapsed;
             self.steps_this_second = (0, Instant::now());
+        }
+    }
+
+    /// One frame's work: take what has arrived from the GPU, run `steps` simulation
+    /// steps, and ask the GPU for what the stroke in progress needs next.
+    pub fn frame(&mut self, steps: usize) {
+        self.pump();
+        if steps > 0 {
+            self.step_sim(steps);
+        }
+        self.request_stroke();
+    }
+
+    /// GPU readbacks cannot block (the browser): input waits for the layers it needs.
+    fn deferring(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.deferred)
+    }
+
+    /// Is a stroke painting a GPU-held layer, with steps still to stamp?
+    fn stroke_in_flight(&self) -> bool {
+        self.painting && self.gpu_stroke
+    }
+
+    /// Whether a press paints only the active layer, and whether it paints it on the GPU.
+    fn stroke_plan(&self) -> (bool, bool) {
+        // a stroke changes only the active layer, unless masking fluid recomputes every
+        // layer's stencil
+        let partial = self.mode == ClickMode::Paint && !self.doc.layers.iter().any(|l| l.masking_fluid);
+        let active = self.doc.active;
+        // a stroke on a layer the GPU holds keeps it there: each brush step brings back only
+        // the cells it can reach (not for tools that read the whole layer)
+        let (w, h) = (self.doc.w, self.doc.h);
+        let at = Sample { x: self.cursor.0, y: self.cursor.1, pressure: 1.0 };
+        let reach = self.brush.reach_bounds(at, w, h).is_some();
+        (partial, partial && reach && self.gpu.as_ref().is_some_and(|g| g.holds(active)))
+    }
+
+    /// Are the layers of `scope` back on the CPU? If not, they are asked for.
+    fn layers_back(&mut self, scope: crate::gpu::Scope) -> bool {
+        let Some(g) = &mut self.gpu else { return true };
+        if g.settled(scope) {
+            return true;
+        }
+        g.request_release(scope);
+        g.hold = true;
+        false
+    }
+
+    /// Can `input` be handled now? If not, what it waits for is on its way.
+    fn ready(&mut self, input: &Input) -> bool {
+        use crate::gpu::Scope;
+        match input {
+            Input::Move | Input::Release => true,
+            Input::Press => {
+                if self.stroke_in_flight() {
+                    return false;
+                }
+                let active = self.doc.active;
+                match self.stroke_plan() {
+                    // on the GPU, unless the layer is on its way back
+                    (_, true) => !self.gpu.as_ref().is_some_and(|g| g.releasing(active)) || self.layers_back(Scope::Layer(active)),
+                    (true, false) => self.layers_back(Scope::Layer(active)),
+                    (false, false) => self.layers_back(Scope::All),
+                }
+            }
+            Input::Cmd(c) => (c.brush_only() && self.xform.is_none()) || (!self.stroke_in_flight() && self.layers_back(Scope::All)),
+        }
+    }
+
+    /// Queue `input` if it has to wait (or follows input that does); otherwise hand it
+    /// back to be handled now.
+    fn defer(&mut self, input: Input) -> Option<Input> {
+        if !self.deferring() {
+            return Some(input);
+        }
+        // a stroke in progress takes its moves and its release as they come
+        let live = self.painting && !self.stroke_ending && matches!(input, Input::Move | Input::Release);
+        if live || (self.backlog.is_empty() && self.ready(&input)) {
+            return Some(input);
+        }
+        self.backlog.push_back(Deferred { input, cursor: self.cursor, pressure: self.pressure, free_corner: self.free_corner });
+        None
+    }
+
+    /// Take what has arrived from the GPU and handle the input that was waiting for it.
+    /// Does nothing where readbacks can block.
+    pub fn pump(&mut self) {
+        if !self.deferring() {
+            return;
+        }
+        if let Some(g) = &mut self.gpu {
+            g.pump(&mut self.doc);
+        }
+        self.pump_stroke();
+        let mut hold = self.settling;
+        while let Some(d) = self.backlog.pop_front() {
+            if !self.ready(&d.input) {
+                hold = true;
+                self.backlog.push_front(d);
+                break;
+            }
+            (self.cursor, self.pressure, self.free_corner) = (d.cursor, d.pressure, d.free_corner);
+            match d.input {
+                Input::Press => self.press_now(),
+                Input::Move => self.moved_now(),
+                Input::Release => self.release_now(),
+                Input::Cmd(c) => self.run_now(c),
+            }
+        }
+        if let Some(g) = &mut self.gpu {
+            g.hold = hold;
+        }
+    }
+
+    /// For an interface that queues requests which read or edit layers (the browser's
+    /// agent API): true once every layer is on the CPU and no input is waiting. Until
+    /// then the layers are on their way; ask again next frame.
+    pub fn settle(&mut self) -> bool {
+        use crate::gpu::Scope;
+        self.settling = self.deferring() && (!self.backlog.is_empty() || self.stroke_in_flight() || !self.layers_back(Scope::All));
+        if let (false, Some(g)) = (self.settling, &mut self.gpu) {
+            g.hold = false;
+        }
+        !self.settling
+    }
+
+    #[cfg(test)]
+    pub fn debug_state(&self) -> String {
+        format!(
+            "gpu_stroke {}, ending {}, queued {}, region_wait {:?}, backlog {}, holds {:?}",
+            self.gpu_stroke,
+            self.stroke_ending,
+            self.queued.len(),
+            self.region_wait,
+            self.backlog.len(),
+            self.gpu.as_ref().map(|g| g.holds(self.doc.active))
+        )
+    }
+
+    /// Stamp the steps whose cells have come back from the GPU, and send them back.
+    fn pump_stroke(&mut self) {
+        let Some((count, end)) = self.region_wait else { return };
+        let i = self.doc.active;
+        let Some(rect) = self.gpu.as_mut().and_then(|g| g.take_region(&mut self.doc, i)) else { return };
+        self.region_wait = None;
+        self.stamp(count, end);
+        if let Some(g) = &mut self.gpu {
+            g.write_region(&self.doc, i, rect);
+        }
+    }
+
+    /// Ask the GPU for the cells the queued steps of the stroke can reach.
+    fn request_stroke(&mut self) {
+        if !self.deferring() || !self.stroke_in_flight() || self.region_wait.is_some() || self.queued.is_empty() {
+            return;
+        }
+        let i = self.doc.active;
+        let (count, end) = (self.queued.len(), self.stroke_ending);
+        let rect = self.gpu.as_ref().is_some_and(|g| g.holds(i)).then(|| self.queued_reach()).flatten();
+        if rect.is_some_and(|r| self.gpu.as_mut().is_some_and(|g| g.request_region(i, r))) {
+            self.region_wait = Some((count, end));
+        } else {
+            // the layer is on the CPU (or the steps reach nothing): stamp them there
+            self.stamp(count, end);
+        }
+    }
+
+    /// The cells the queued steps can reach, from the state before the first: the dabs lie
+    /// on the path through the queued samples.
+    fn queued_reach(&self) -> Option<wet_fluid_gpu::Rect> {
+        let (w, h) = (self.doc.w, self.doc.h);
+        self.queued
+            .iter()
+            .map(|&s| self.brush.reach_bounds(s, w, h))
+            .try_fold(None, |acc: Option<wet_fluid_gpu::Rect>, r| {
+                let r = r?;
+                Some(Some(acc.map_or(r, |a| (a.0.min(r.0), a.1.min(r.1), a.2.max(r.2), a.3.max(r.3)))))
+            })
+            .flatten()
+    }
+
+    /// Stamp the first `count` queued steps on the active layer's CPU copy; the last of
+    /// them ends the stroke when `end`.
+    fn stamp(&mut self, count: usize, end: bool) {
+        let count = count.min(self.queued.len());
+        let layer = &mut self.doc.layers[self.doc.active].wet;
+        for (k, s) in self.queued.drain(..count).enumerate() {
+            if end && k + 1 == count {
+                self.brush.release(layer, s);
+            } else {
+                self.brush.move_to(layer, s);
+            }
+        }
+        if end {
+            self.painting = false;
+            self.stroke_ending = false;
         }
     }
 
@@ -525,17 +757,15 @@ impl App {
 
     /// Pointer pressed on the canvas at `self.cursor`.
     pub fn press(&mut self) {
+        if self.defer(Input::Press).is_some() {
+            self.press_now();
+        }
+    }
+
+    fn press_now(&mut self) {
         self.epoch += 1;
-        // a stroke changes only the active layer, unless masking fluid recomputes every
-        // layer's stencil
-        let partial = self.mode == ClickMode::Paint && !self.doc.layers.iter().any(|l| l.masking_fluid);
         let active = self.doc.active;
-        // a stroke on a layer the GPU holds keeps it there: each brush step brings back only
-        // the cells it can reach (not for tools that read the whole layer)
-        let (w, h) = (self.doc.w, self.doc.h);
-        let at = Sample { x: self.cursor.0, y: self.cursor.1, pressure: 1.0 };
-        let reach = self.brush.reach_bounds(at, w, h).is_some();
-        let gpu_stroke = partial && reach && self.gpu.as_ref().is_some_and(|g| g.holds(active));
+        let (partial, gpu_stroke) = self.stroke_plan();
         match &mut self.gpu {
             Some(_) if gpu_stroke => {}
             Some(g) if partial => g.release_layer(&mut self.doc, active),
@@ -603,6 +833,7 @@ impl App {
                 self.brush.press(s);
                 self.queued.clear();
                 self.painting = true;
+                self.stroke_ending = false;
                 self.gpu_stroke = gpu_stroke;
             }
         }
@@ -615,33 +846,19 @@ impl App {
         if self.queued.is_empty() {
             return;
         }
-        let steps = std::mem::take(&mut self.queued);
         let i = self.doc.active;
-        let (w, h) = (self.doc.w, self.doc.h);
         let on_gpu = self.gpu_stroke && self.gpu.as_ref().is_some_and(|g| g.holds(i));
-        // every step's reach, from the state before the first: the dabs lie on the path
-        // through the queued samples
-        let rect = on_gpu
-            .then(|| {
-                steps.iter().map(|&s| self.brush.reach_bounds(s, w, h)).try_fold(None, |acc: Option<wet_fluid_gpu::Rect>, r| {
-                    let r = r?;
-                    Some(Some(acc.map_or(r, |a| (a.0.min(r.0), a.1.min(r.1), a.2.max(r.2), a.3.max(r.3)))))
-                })
-            })
-            .flatten()
-            .flatten();
+        // where the GPU cannot be waited for, the cells come back a frame later
+        // (`request_stroke`, `pump_stroke`)
+        if on_gpu && self.deferring() {
+            self.stroke_ending |= end;
+            return;
+        }
+        let rect = on_gpu.then(|| self.queued_reach()).flatten();
         if let (Some(r), Some(g)) = (rect, &mut self.gpu) {
             g.read_region(&mut self.doc, i, r);
         }
-        let layer = &mut self.doc.layers[i].wet;
-        let last = steps.len() - 1;
-        for (k, s) in steps.into_iter().enumerate() {
-            if end && k == last {
-                self.brush.release(layer, s);
-            } else {
-                self.brush.move_to(layer, s);
-            }
-        }
+        self.stamp(self.queued.len(), end);
         if let (Some(r), Some(g)) = (rect, &mut self.gpu) {
             g.write_region(&self.doc, i, r);
         }
@@ -649,7 +866,13 @@ impl App {
 
     /// Pointer moved to `self.cursor` (pressed or not).
     pub fn moved(&mut self) {
-        if self.painting {
+        if self.defer(Input::Move).is_some() {
+            self.moved_now();
+        }
+    }
+
+    fn moved_now(&mut self) {
+        if self.painting && !self.stroke_ending {
             let s = self.sample();
             self.queued.push(s);
             if !self.gpu_stroke {
@@ -665,6 +888,12 @@ impl App {
     }
 
     pub fn release(&mut self) {
+        if self.defer(Input::Release).is_some() {
+            self.release_now();
+        }
+    }
+
+    fn release_now(&mut self) {
         self.epoch += 1;
         match self.mode {
             ClickMode::Transform => {
@@ -691,11 +920,11 @@ impl App {
                 }
             }
             _ => {
-                if self.painting {
+                if self.painting && !self.stroke_ending {
                     let s = self.sample();
                     self.queued.push(s);
+                    // (the stroke ends there, or once its cells are back from the GPU)
                     self.flush_stroke(true);
-                    self.painting = false;
                 }
             }
         }
@@ -863,9 +1092,18 @@ impl App {
     }
 
     pub fn run(&mut self, cmd: Cmd) {
+        if let Some(Input::Cmd(cmd)) = self.defer(Input::Cmd(cmd)) {
+            self.run_now(cmd);
+        }
+    }
+
+    fn run_now(&mut self, cmd: Cmd) {
         self.epoch += 1;
         // the CPU copy of every layer is complete before any command reads or edits it
-        self.release_gpu();
+        // (where the GPU cannot be waited for, brush commands leave the layers there)
+        if !(self.deferring() && cmd.brush_only() && self.xform.is_none()) {
+            self.release_gpu();
+        }
         // any other command applies a pending transform first; undo abandons it
         if self.xform.is_some() {
             match cmd {
